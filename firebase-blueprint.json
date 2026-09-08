@@ -1,0 +1,107 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile with parsed CV data and job search preferences",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "fullName": { "type": "string" },
+        "email": { "type": "string" },
+        "phone": { "type": "string" },
+        "city": { "type": "string" },
+        "cap": { "type": "string" },
+        "skills": { "type": "array" },
+        "profileSummary": { "type": "string" },
+        "permessoG": { "type": "string" },
+        "statoPermesso": { "type": "string" },
+        "cvShortSummary": { "type": "string" },
+        "cvFullSummary": { "type": "string" },
+        "cvFilePath": { "type": "string" },
+        "targetRole": { "type": "string" },
+        "searchRadiusKm": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["userId", "email"]
+    },
+    "Company": {
+      "title": "Company",
+      "description": "Company found during candidate outreach search",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "sector": { "type": "string" },
+        "city": { "type": "string" },
+        "address": { "type": "string" },
+        "email": { "type": "string" },
+        "phone": { "type": "string" },
+        "website": { "type": "string" },
+        "matchScore": { "type": "number" },
+        "confidenceScore": { "type": "number" },
+        "finalStatus": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["name", "userId"]
+    },
+    "SentEmail": {
+      "title": "SentEmail",
+      "description": "Log of emails sent to companies",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "companyName": { "type": "string" },
+        "email": { "type": "string" },
+        "subject": { "type": "string" },
+        "body": { "type": "string" },
+        "sentAt": { "type": "string" },
+        "status": { "type": "string" }
+      },
+      "required": ["userId", "email", "companyName", "sentAt"]
+    },
+    "Campaign": {
+      "title": "Campaign",
+      "description": "Automated candidate outreach campaign state",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "status": { "type": "string" },
+        "searchLocation": { "type": "string" },
+        "searchRadius": { "type": "number" },
+        "targetTotal": { "type": "number" },
+        "totalSent": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["userId", "status"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Stores user profile and CV data"
+    },
+    "/users/{userId}/companies/{companyId}": {
+      "schema": "Company",
+      "description": "Stores companies discovered or targeted by user"
+    },
+    "/users/{userId}/sent_emails/{emailId}": {
+      "schema": "SentEmail",
+      "description": "Stores sent outreach email history"
+    },
+    "/users/{userId}/campaigns/{campaignId}": {
+      "schema": "Campaign",
+      "description": "Stores automated campaign tracking"
+    },
+    "/users/{userId}/campaign_queue/{queueId}": {
+      "description": "Stores queued targets for automated campaigns"
+    },
+    "/users/{userId}/tokens/{tokenId}": {
+      "description": "Stores private user OAuth credentials"
+    }
+  }
+}
