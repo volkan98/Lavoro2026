@@ -1,3 +1,6 @@
+import { scopedStorageKey } from '@/lib/api/client';
+import { requireUid } from '@/lib/api/client';
+import { apiFetch } from '@/lib/api/client';
 import { useState } from 'react';
 import { useAuth } from '@/hooks/useAuth';
 import { useToast } from '@/hooks/use-toast';
@@ -37,7 +40,7 @@ export function ManualCompanySearch({ campaignId }: ManualCompanySearchProps) {
   const [isSearching, setIsSearching] = useState(false);
   const [addedEmails, setAddedEmails] = useState<Set<string>>(new Set());
 
-  const userId = user?.id || 'user_blunero90';
+  const userId = requireUid(user?.id);
 
   const handleSearch = async () => {
     if (!query.trim()) return;
@@ -124,7 +127,7 @@ export function ManualCompanySearch({ campaignId }: ManualCompanySearchProps) {
 
     // Save to Server
     try {
-      await fetch('/api/campaign-queue', {
+      await apiFetch('/api/campaign-queue', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(queueRecord),
@@ -135,11 +138,11 @@ export function ManualCompanySearch({ campaignId }: ManualCompanySearchProps) {
 
     // Save to LocalStorage and notify hook
     try {
-      const stored = localStorage.getItem('ais_job_outreach_campaign_queue');
+      const stored = localStorage.getItem(scopedStorageKey('ais_job_outreach_campaign_queue'));
       const items = stored ? JSON.parse(stored) : [];
       if (!items.some((i: any) => i.id === queueRecord.id || i.company_email === queueRecord.company_email)) {
         items.unshift(queueRecord);
-        localStorage.setItem('ais_job_outreach_campaign_queue', JSON.stringify(items));
+        localStorage.setItem(scopedStorageKey('ais_job_outreach_campaign_queue'), JSON.stringify(items));
         window.dispatchEvent(new Event('campaign_queue_updated'));
       }
     } catch (e) {

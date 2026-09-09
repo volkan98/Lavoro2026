@@ -1,14 +1,17 @@
+import { firebaseAuthMiddleware } from './server/auth';
+import { createCvParser } from './server/cvParser';
+import { mergeCvData, hasCvData } from './src/lib/cvNormalizer';
+import { createHash } from 'node:crypto';
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 
 dotenv.config();
 
 // In-memory / file-backed persistent store for local data
-const DB_FILE = path.join(process.cwd(), "app_data.json");
+const DB_FILE = process.env.APP_DATA_FILE || path.join(process.cwd(), "app_data.json");
 interface AppDb {
   profiles: Record<string, any>;
   companies: any[];
@@ -51,22 +54,39 @@ function loadDb(): AppDb {
     campaign_queue: [],
     blacklist: [],
   };
-  saveDb(initialDb);
   return initialDb;
 }
 
 function saveDb(db: AppDb) {
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), "utf-8");
+    fs.writeFileSync(`${DB_FILE}.tmp`, JSON.stringify(rootDb, null, 2), "utf-8");
+    fs.renameSync(`${DB_FILE}.tmp`, DB_FILE);
   } catch (e) {
-    console.error("Error saving db file:", e);
+    throw e;
   }
 }
 
-let db = loadDb();
+const rootDb = loadDb();
+function userDb(uid: string): AppDb {
+  const tenants = ((rootDb as any).users ||= {});
+  if (!tenants[uid]) {
+    // Import legacy records only with explicit ownership. Never claim unscoped data.
+    tenants[uid] = {
+      profiles: rootDb.profiles[uid] ? { [uid]: rootDb.profiles[uid] } : {},
+      cv_files: (rootDb as any).cv_files?.[uid] ? { [uid]: (rootDb as any).cv_files[uid] } : {},
+      companies: rootDb.companies.filter(x => (x.user_id || x.userId) === uid),
+      sent_emails: rootDb.sent_emails.filter(x => x.user_id === uid),
+      campaigns: rootDb.campaigns.filter(x => x.user_id === uid),
+      campaign_events: rootDb.campaign_events.filter(x => x.user_id === uid),
+      campaign_queue: rootDb.campaign_queue.filter(x => x.user_id === uid),
+      blacklist: rootDb.blacklist.filter((x: any) => x.user_id === uid),
+    };
+  }
+  return tenants[uid];
+}
 // Ensure file exists immediately
 if (!fs.existsSync(DB_FILE)) {
-  saveDb(db);
+  saveDb(rootDb);
 }
 
 // Initialize Google Gemini Client lazily or safely
@@ -203,137 +223,26 @@ function parseJsonWithTruncationRecovery(raw: string): any {
   return null;
 }
 
-async function startServer() {
+export async function createApplication(options: { verifyToken?: any; generateCv?: any; serveFrontend?: boolean } = {}) {
   const app = express();
-  const PORT = 3000;
 
   app.use(express.json({ limit: "25mb" }));
 
   // Health check
   app.get("/api/health", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     res.json({ status: "ok", aiProvider: "Google Gemini", version: "2.0" });
   });
 
-  // 1. AI Parse CV (Ultra-Fast & Structured)
-  app.post("/api/ai/parse-cv", async (req, res) => {
-    try {
-      let { cvText, base64Data, mimeType } = req.body;
-      if (!cvText && !base64Data) {
-        return res.status(400).json({ success: false, error: "Dati del CV mancanti (testo o file)" });
-      }
-
-      // If base64Data is present and cvText is missing, attempt fast text extraction from buffer
-      if (!cvText && base64Data) {
-        try {
-          const buffer = Buffer.from(base64Data, "base64");
-          const rawStr = buffer.toString("utf-8");
-          // Check if it's plain text or has clean printable content
-          const printableChars = rawStr.replace(/[^\x20-\x7E\n\r\t]/g, " ");
-          const words = printableChars.split(/\s+/).filter((w) => w.length > 2);
-          if (words.length > 40 && (!mimeType || mimeType.includes("text") || mimeType.includes("word"))) {
-            cvText = words.slice(0, 1500).join(" ");
-          }
-        } catch (e) {
-          // ignore, will use multimodal inlineData
-        }
-      }
-
-      const prompt = `Sei un assistente esperto di recruiting in Svizzera (Ticino/Grigioni) e Italia.
-Analizza il seguente CV ed estrai rapidamente le informazioni essenziali in formato JSON.
-${cvText ? `\nTESTO CV:\n${cvText.substring(0, 8000)}` : "\nAnalizza il documento CV allegato."}
-
-REGOLE PERMESSO G (FRONTALIERI SVIZZERA):
-1. In "sintesiBreve", evidenzia subito: Permesso G (Frontalieri Svizzera) pronto/idoneo, ruolo, anni di esperienza e disponibilità.
-2. In "sintesiCompleta", il primo bullet DEVE essere: "• **Permesso di Lavoro Svizzera**: In possesso / Idoneo al rilascio immediato del **Permesso G (Frontalieri)** – Nessun ostacolo burocratico per l'assunzione".
-3. Compila "permessoG": "Idoneo (Cittadino UE / Frontaliere)" o "In possesso".
-
-Rispondi SOLO con un JSON valido:
-{
-  "nome": "string",
-  "cognome": "string",
-  "email": "string",
-  "telefono": "string",
-  "citta": "string",
-  "cap": "string",
-  "profilo": "breve sintesi",
-  "permessoG": "In possesso" | "Idoneo (Cittadino UE / Frontaliere)",
-  "statoPermesso": "Permesso G (Frontalieri Svizzera) - Attivabile / Valido",
-  "competenze": ["competenza 1", "competenza 2", "competenza 3"],
-  "esperienze": [
-    {
-      "ruolo": "string",
-      "azienda": "string",
-      "dataInizio": "YYYY",
-      "dataFine": "YYYY o Presente",
-      "descrizione": "breve sintesi"
-    }
-  ],
-  "istruzione": [
-    {
-      "titolo": "string",
-      "istituto": "string",
-      "anno": "YYYY"
-    }
-  ],
-  "lingue": [
-    {
-      "lingua": "string",
-      "livello": "string"
-    }
-  ],
-  "sintesiBreve": "Permesso G pronto + sintesi rapida competenze e disponibilità",
-  "sintesiCompleta": "Bullet points con Permesso G in evidenza al primo posto"
-}`;
-
-      let contents: any;
-      if (cvText) {
-        contents = prompt;
-      } else if (base64Data) {
-        contents = [
-          {
-            role: "user",
-            parts: [
-              { text: prompt },
-              {
-                inlineData: {
-                  mimeType: mimeType || "application/pdf",
-                  data: base64Data,
-                },
-              },
-            ],
-          },
-        ];
-      } else {
-        contents = prompt;
-      }
-
-      const response = await generateGeminiContentWithFallback({
-        preferredModel: "gemini-3.1-flash-lite",
-        fallbackModels: ["gemini-flash-latest", "gemini-3.8-flash"],
-        contents,
-        config: {
-          responseMimeType: "application/json",
-          temperature: 0.1,
-          maxOutputTokens: 4000,
-        },
-      });
-
-      const responseText = response.text || "{}";
-      const parsedCV = parseJsonWithTruncationRecovery(responseText);
-      if (!parsedCV) {
-        console.error("Failed to parse Gemini CV response:", responseText);
-        return res.status(500).json({ success: false, error: "Errore nel parsing della risposta AI" });
-      }
-
-      return res.json({ success: true, data: parsedCV });
-    } catch (error: any) {
-      console.error("Error in parse-cv:", error);
-      return res.status(500).json({ success: false, error: error.message || "Errore durante l'analisi del CV" });
-    }
+  app.use('/api', firebaseAuthMiddleware(options.verifyToken), (req, res, next) => {
+    res.locals.userDb = userDb(res.locals.uid);
+    next();
   });
+  app.post('/api/ai/parse-cv', createCvParser(options.generateCv || generateGeminiContentWithFallback));
 
   // 2. AI Search Companies (Fast & Guaranteed Zero-Error with Curated Dataset)
   app.post("/api/ai/search-companies", async (req, res) => {
+    const db = res.locals.userDb as AppDb;
     try {
       const {
         location,
@@ -877,8 +786,9 @@ Rispondi SOLO con un array JSON di aziende con questo schema per ogni elemento (
 
   // 3. AI Generate Email (Deeply Grounded in Real Candidate Data, Natural & Concise: 100-160 words)
   app.post("/api/ai/generate-email", async (req, res) => {
+    const db = res.locals.userDb as AppDb;
     try {
-      const { company, cvData, variant = "standard", targetRole = "", availability = "immediata" } = req.body;
+      const { company, cvData, variant = "standard", targetRole = "", availability = "" } = req.body;
 
       if (!company || !cvData) {
         return res.status(400).json({ success: false, error: "Dati azienda o CV mancanti" });
@@ -888,8 +798,8 @@ Rispondi SOLO con un array JSON di aziende con questo schema per ogni elemento (
       const compSector = (company.sector || "").trim();
       const compCity = (company.city || "").trim();
 
-      const fullName = `${cvData.nome || ""} ${cvData.cognome || ""}`.trim() || "Candidato";
-      const role = (targetRole || cvData.targetRole || cvData.esperienze?.[0]?.ruolo || (Array.isArray(cvData.competenze) && cvData.competenze[0]) || "").trim() || "Professionista";
+      const fullName = `${cvData.nome || ""} ${cvData.cognome || ""}`.trim() || "";
+      const role = (targetRole || cvData.targetRole || cvData.esperienze?.[0]?.ruolo || (Array.isArray(cvData.competenze) && cvData.competenze[0]) || "").trim() || "";
       const skillsArray = Array.isArray(cvData.competenze) ? cvData.competenze.filter(Boolean) : [];
       const skillsStr = skillsArray.slice(0, 5).join(", ");
       
@@ -1000,7 +910,7 @@ Rispondi con un oggetto JSON valido:
   });
 
   function formatCleanSignature(cvData: any, targetRole?: string): string {
-    const fullName = `${cvData?.nome || ""} ${cvData?.cognome || ""}`.trim() || "Candidato";
+    const fullName = `${cvData?.nome || ""} ${cvData?.cognome || ""}`.trim() || "";
     const role = targetRole || cvData?.targetRole || cvData?.esperienze?.[0]?.ruolo || "";
     
     const lines: string[] = [
@@ -1031,7 +941,7 @@ Rispondi con un oggetto JSON valido:
     role: string,
     availability: string
   ) {
-    const fullName = `${cvData.nome || ""} ${cvData.cognome || ""}`.trim() || "Candidato";
+    const fullName = `${cvData.nome || ""} ${cvData.cognome || ""}`.trim() || "";
     const compName = company.name || "Spettabile Azienda";
     const userCity = cvData.citta || "";
     const skillsArray = Array.isArray(cvData.competenze) ? cvData.competenze.filter(Boolean) : [];
@@ -1041,7 +951,7 @@ Rispondi con un oggetto JSON valido:
 
     const firstExp = Array.isArray(cvData.esperienze) && cvData.esperienze.length > 0 ? cvData.esperienze[0] : null;
     const expSnippet = firstExp && firstExp.ruolo
-      ? `Ho operato come ${firstExp.ruolo}${firstExp.azienda ? ` presso ${firstExp.azienda}` : ""}, svolgendo le mansioni con precisione e affidabilità.`
+      ? `Ho operato come ${firstExp.ruolo}${firstExp.azienda ? ` presso ${firstExp.azienda}` : ""}.`
       : "";
 
     const locPart = userCity ? `Residente a ${userCity}, ` : "";
@@ -1052,7 +962,7 @@ Rispondi con un oggetto JSON valido:
     const oggetto = role ? `Candidatura spontanea – ${role}` : "Candidatura spontanea";
 
     const corpo = `Gentile Responsabile delle Risorse Umane di <b>${compName}</b>,<br><br>` +
-      `desidero sottoporre la mia candidatura spontanea per opportunità lavorative nel ruolo di <b>${role || "operatore specializzato"}</b>.<br><br>` +
+      `desidero sottoporre la mia candidatura spontanea per opportunità lavorative nel ruolo di <b>${role || ""}</b>.<br><br>` +
       `${skillsSnippet ? `${skillsSnippet} ` : ""}${expSnippet ? `${expSnippet} ` : ""}` +
       `${locPart}${availPart}<br><br>` +
       `In allegato trasmetto il mio Curriculum Vitae dettagliato e resto a Vostra completa disposizione per un colloquio conoscitivo.<br><br>` +
@@ -1063,15 +973,16 @@ Rispondi con un oggetto JSON valido:
       corpo,
       firma: formatCleanSignature(cvData, role),
       matchPoints: [
-        `Ruolo: ${role || "Professionista"}`,
-        skillsArray[0] ? `Competenza reale: ${skillsArray[0]}` : "Profilo allineato",
-        userCity ? `Località: ${userCity}` : "Disponibilità immediata",
+        `Ruolo: ${role || ""}`,
+        skillsArray[0] ? `Competenza reale: ${skillsArray[0]}` : "",
+        userCity ? `Località: ${userCity}` : "",
       ],
     };
   }
 
   // 4. Duplicate Check & Sent Emails Recording
   app.post("/api/check-duplicate", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     const { email, company_name, domain } = req.body;
     const normEmail = (email || "").toLowerCase().trim();
     const normName = (company_name || "").toLowerCase().trim();
@@ -1101,15 +1012,17 @@ Rispondi con un oggetto JSON valido:
   });
 
   app.get("/api/sent-emails", (req, res) => {
-    const userId = (req.query.userId as string) || "";
+    const db = res.locals.userDb as AppDb;
+    const userId = res.locals.uid;
     if (userId) {
-      const userEmails = db.sent_emails.filter((item) => !item.user_id || item.user_id === userId);
+      const userEmails = db.sent_emails.filter((item) => item.user_id === userId);
       return res.json({ success: true, data: userEmails });
     }
     res.json({ success: true, data: db.sent_emails });
   });
 
   app.post("/api/sent-emails", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     const {
       companyId,
       company_id,
@@ -1127,7 +1040,7 @@ Rispondi con un oggetto JSON valido:
     const resolvedCompanyName = (company_name || companyName || "Azienda").trim();
     const resolvedCompanyId = company_id || companyId || null;
     const resolvedCvVersion = cv_version || cvVersion || "1.0";
-    const resolvedUserId = user_id || userId || "user_blunero90";
+    const resolvedUserId = res.locals.uid;
 
     const normEmail = (email || "").toLowerCase().trim();
     const domain = normEmail.includes("@") ? normEmail.split("@")[1] : "";
@@ -1157,6 +1070,7 @@ Rispondi con un oggetto JSON valido:
   });
 
   app.delete("/api/sent-emails/:id", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     const { id } = req.params;
     db.sent_emails = db.sent_emails.filter((item) => item.id !== id);
     saveDb(db);
@@ -1165,8 +1079,10 @@ Rispondi con un oggetto JSON valido:
 
   // CV File Upload & Binary Storage
   app.post("/api/cv/upload", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     try {
-      const { userId, fileName, base64Data, mimeType } = req.body;
+      const { fileName, base64Data, mimeType } = req.body;
+      const userId = res.locals.uid;
       if (!userId || !fileName || !base64Data) {
         return res.status(400).json({ success: false, error: "UserId, fileName e base64Data mancanti" });
       }
@@ -1175,7 +1091,15 @@ Rispondi con un oggetto JSON valido:
         (db as any).cv_files = {};
       }
 
+      const bytes = Buffer.from(base64Data, 'base64');
+      if (!bytes.length || bytes.length > 15 * 1024 * 1024) return res.status(400).json({ success: false, error: 'File CV vuoto o troppo grande' });
+      const contentHash = createHash('sha256').update(bytes).digest('hex');
+      if (req.body.contentHash && req.body.contentHash !== contentHash) return res.status(400).json({ success: false, error: 'Integrità file CV non valida' });
+      const older = (db as any).cv_files[userId];
+      const versions = ((db as any).cv_file_versions ||= {});
+      if (older?.base64Data) versions[older.contentHash || createHash('sha256').update(Buffer.from(older.base64Data, 'base64')).digest('hex')] = older;
       (db as any).cv_files[userId] = {
+        uid: userId, contentHash, sizeBytes: bytes.length, origin: 'upload',
         fileName,
         base64Data,
         mimeType: mimeType || "application/pdf",
@@ -1190,11 +1114,14 @@ Rispondi con un oggetto JSON valido:
   });
 
   app.get("/api/cv/file", (req, res) => {
-    const userId = (req.query.userId as string);
+    const db = res.locals.userDb as AppDb;
+    const userId = res.locals.uid;
     if (!userId) {
       return res.status(400).json({ success: false, error: "userId mancante" });
     }
-    const fileInfo = (db as any).cv_files?.[userId] || null;
+    const requestedHash = req.query.hash as string;
+    const currentFile = (db as any).cv_files?.[userId];
+    const fileInfo = requestedHash && currentFile?.contentHash !== requestedHash ? (db as any).cv_file_versions?.[requestedHash] : currentFile;
     if (!fileInfo) {
       return res.status(404).json({ success: false, error: "Nessun file CV salvato per questo utente" });
     }
@@ -1203,7 +1130,8 @@ Rispondi con un oggetto JSON valido:
 
   // 5. User Profile persistence
   app.get("/api/user/profile", (req, res) => {
-    const userId = (req.query.userId as string);
+    const db = res.locals.userDb as AppDb;
+    const userId = res.locals.uid;
     if (!userId) {
       return res.status(400).json({ success: false, error: "userId mancante" });
     }
@@ -1212,27 +1140,30 @@ Rispondi con un oggetto JSON valido:
   });
 
   app.post("/api/user/profile", (req, res) => {
-    const resolvedUserId = req.body.user_id || req.body.userId;
+    const db = res.locals.userDb as AppDb;
+    const resolvedUserId = res.locals.uid;
     if (!resolvedUserId) {
       return res.status(400).json({ success: false, error: "user_id mancante" });
     }
-    const profileData = req.body;
-    db.profiles[resolvedUserId] = {
-      id: `prof_${resolvedUserId}`,
-      user_id: resolvedUserId,
-      ...profileData,
-      updated_at: new Date().toISOString(),
-    };
+    const previous = db.profiles[resolvedUserId] || {};
+    const patch = Object.fromEntries(Object.entries(req.body).filter(([key, value]) =>
+      !['uid', 'userId', 'user_id', 'id', 'cvParsedData'].includes(key) && value != null && value !== '' && (!Array.isArray(value) || value.length)));
+    db.profiles[resolvedUserId] = { ...previous, ...patch, id: resolvedUserId, user_id: resolvedUserId,
+      ...(hasCvData(req.body.cvParsedData) ? { cvParsedData: mergeCvData(previous.cvParsedData, req.body.cvParsedData) } : {}),
+      updated_at: new Date().toISOString() };
+    // Legacy backup only. This endpoint cannot write or replace the authoritative Firestore CV.
     saveDb(db);
     res.json({ success: true, data: db.profiles[resolvedUserId] });
   });
 
   // 6. Saved Companies
   app.get("/api/companies", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     res.json({ success: true, data: db.companies });
   });
 
   app.post("/api/companies", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     const company = req.body;
     const id = company.id || `comp_${Date.now()}`;
     const newComp = { ...company, id, created_at: new Date().toISOString() };
@@ -1243,10 +1174,12 @@ Rispondi con un oggetto JSON valido:
 
   // 6b. Email & Domain Blacklist Management
   app.get("/api/blacklist", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     res.json({ success: true, data: db.blacklist || [] });
   });
 
   app.post("/api/blacklist", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     const { pattern, type, notes } = req.body || {};
     if (!pattern || typeof pattern !== "string" || !pattern.trim()) {
       return res.status(400).json({ success: false, error: "Pattern email o dominio mancante." });
@@ -1288,6 +1221,7 @@ Rispondi con un oggetto JSON valido:
   });
 
   app.delete("/api/blacklist/:id", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     const { id } = req.params;
     if (!db.blacklist) db.blacklist = [];
     const beforeLen = db.blacklist.length;
@@ -1298,10 +1232,12 @@ Rispondi con un oggetto JSON valido:
 
   // 7. Auto Campaign Processor & Queue
   app.get("/api/campaigns", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     res.json({ success: true, data: db.campaigns[0] || null, events: db.campaign_events || [] });
   });
 
   app.post("/api/campaigns", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     const campaignData = req.body;
     const newCamp = {
       id: campaignData.id || `camp_${Date.now()}`,
@@ -1334,6 +1270,7 @@ Rispondi con un oggetto JSON valido:
   });
 
   app.patch("/api/campaigns/:id", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     const id = req.params.id;
     const updates = req.body;
     const camp = db.campaigns.find((c: any) => c.id === id) || db.campaigns[0];
@@ -1350,6 +1287,7 @@ Rispondi con un oggetto JSON valido:
   });
 
   app.delete("/api/campaigns", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     db.campaigns = [];
     db.campaign_events = [];
     db.campaign_queue = [];
@@ -1358,10 +1296,12 @@ Rispondi con un oggetto JSON valido:
   });
 
   app.get("/api/campaign-queue", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     res.json({ success: true, data: db.campaign_queue || [] });
   });
 
   app.post("/api/campaign-queue", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     const item = req.body;
     if (Array.isArray(item)) {
       item.forEach((it: any) => {
@@ -1385,6 +1325,7 @@ Rispondi con un oggetto JSON valido:
   });
 
   app.put("/api/campaign-queue/:id", (req, res) => {
+    const db = res.locals.userDb as AppDb;
     const id = req.params.id;
     const updates = req.body;
     const idx = db.campaign_queue.findIndex((q: any) => q.id === id);
@@ -1397,264 +1338,30 @@ Rispondi con un oggetto JSON valido:
     }
   });
 
-  // Helper to build RFC 2822 MIME message for Gmail / Outlook
-  function buildRfc2822MimeMessage({
-    to,
-    from = "me",
-    subject,
-    bodyHtml,
-    attachmentFilename,
-    attachmentBase64,
-    attachmentMimeType = "application/pdf",
-  }: {
-    to: string;
-    from?: string;
-    subject: string;
-    bodyHtml: string;
-    attachmentFilename?: string;
-    attachmentBase64?: string;
-    attachmentMimeType?: string;
-  }): string {
-    const boundary = `====boundary_${Date.now()}_${Math.random().toString(36).substring(2, 9)}====`;
-    const cleanBody = bodyHtml.includes("<") ? bodyHtml : bodyHtml.replace(/\n/g, "<br>");
-    
-    let mime = "";
-    mime += `To: ${to}\r\n`;
-    mime += `From: ${from}\r\n`;
-    mime += `Subject: =?UTF-8?B?${Buffer.from(subject).toString("base64")}?=\r\n`;
-    mime += `MIME-Version: 1.0\r\n`;
-
-    if (attachmentBase64 && attachmentFilename) {
-      mime += `Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n`;
-      
-      // HTML Part
-      mime += `--${boundary}\r\n`;
-      mime += `Content-Type: text/html; charset="UTF-8"\r\n`;
-      mime += `Content-Transfer-Encoding: 7bit\r\n\r\n`;
-      mime += `${cleanBody}\r\n\r\n`;
-
-      // Attachment Part
-      mime += `--${boundary}\r\n`;
-      mime += `Content-Type: ${attachmentMimeType}; name="${attachmentFilename}"\r\n`;
-      mime += `Content-Disposition: attachment; filename="${attachmentFilename}"\r\n`;
-      mime += `Content-Transfer-Encoding: base64\r\n\r\n`;
-      mime += `${attachmentBase64.replace(/(.{76})/g, "$1\r\n")}\r\n\r\n`;
-      mime += `--${boundary}--\r\n`;
-    } else {
-      mime += `Content-Type: text/html; charset="UTF-8"\r\n`;
-      mime += `Content-Transfer-Encoding: 7bit\r\n\r\n`;
-      mime += `${cleanBody}\r\n`;
-    }
-
-    return Buffer.from(mime)
-      .toString("base64")
-      .replace(/\+/g, "-")
-      .replace(/\//g, "_")
-      .replace(/=+$/, "");
-  }
-
-  // 8. Email OAuth Management & Dispatch
-  app.post("/api/email-oauth", async (req, res) => {
-    const { action, provider, code, email_data } = req.body || {};
-
-    if (action === "get_status") {
-      const providers = (db as any).connected_providers || [
-        { provider: "gmail", email: "blunero90@gmail.com", connected: true },
-      ];
-      return res.json({ success: true, providers });
-    }
-
-    if (action === "get_auth_url") {
-      return res.json({
-        success: true,
-        authUrl: `https://accounts.google.com/o/oauth2/v2/auth?client_id=preview&response_type=code&scope=https://www.googleapis.com/auth/gmail.send&redirect_uri=${encodeURIComponent(
-          req.body.redirect_uri || "http://localhost:3000/oauth-callback"
-        )}`,
-      });
-    }
-
-    if (action === "exchange_code") {
-      const providers = [
-        { provider: provider || "gmail", email: "blunero90@gmail.com", connected: true },
-      ];
-      (db as any).connected_providers = providers;
+  // Gmail is authorized and sent directly through the verified session in workspaceAuth.
+  app.post('/api/email-oauth', (req, res) => {
+    const db = res.locals.userDb as AppDb;
+    const { action, email_data } = req.body || {};
+    if (action === 'get_status' || action === 'disconnect') return res.json({ success: true, providers: [] });
+    if (action === 'record_sent' && email_data?.gmail_message_id) {
+      const record = { ...email_data, id: email_data.gmail_message_id, user_id: res.locals.uid,
+        email: email_data.to, status: 'sent', sent_at: new Date().toISOString() };
+      if (!db.sent_emails.some(x => x.id === record.id)) db.sent_emails.unshift(record);
       saveDb(db);
-      return res.json({ success: true, email: "blunero90@gmail.com", providers });
+      return res.json({ success: true, sent_id: record.id });
     }
-
-    if (action === "disconnect") {
-      const providers = ((db as any).connected_providers || []).filter((p: any) => p.provider !== provider);
-      (db as any).connected_providers = providers;
-      saveDb(db);
-      return res.json({ success: true, providers });
-    }
-
-    if (action === "record_sent") {
-      const to = (email_data?.to || "").trim().toLowerCase();
-      const subject = email_data?.subject || "Candidatura";
-      const body = email_data?.body || "";
-      const gmailMessageId = email_data?.gmail_message_id;
-      const attachmentName = email_data?.attachment_name || "Curriculum_Vitae.pdf";
-
-      const newSent = {
-        id: `sent_${Date.now()}`,
-        company_id: email_data?.company_id || null,
-        company_name: email_data?.company_name || to.split("@")[0] || "Azienda",
-        email: to,
-        subject,
-        body,
-        cv_version: "1.0",
-        has_attachment: true,
-        attachment_name: attachmentName,
-        status: "sent",
-        gmail_message_id: gmailMessageId || null,
-        sent_at: new Date().toISOString(),
-      };
-
-      db.sent_emails.unshift(newSent);
-      saveDb(db);
-
-      return res.json({ success: true, message: "Email registrata tra gli invii", sent_id: newSent.id });
-    }
-
-    if (action === "send_email") {
-      const to = (email_data?.to || "").trim();
-      const subject = (email_data?.subject || "Candidatura spontanea").trim();
-      const body = email_data?.body || "";
-      const cvPath = email_data?.attachment_path || email_data?.cv_path;
-      let cvBase64 = email_data?.cv_base64 || email_data?.attachment_data?.base64 || email_data?.attachment?.base64;
-      let cvFilename = email_data?.cv_filename || email_data?.attachment_data?.filename || email_data?.attachment?.filename || (cvPath ? path.basename(cvPath) : "Curriculum_Vitae.pdf");
-      const cvMimeType = email_data?.cv_mimetype || email_data?.attachment_data?.mimeType || email_data?.attachment?.mimeType || "application/pdf";
-      const forceSend = email_data?.force_send === true;
-
-      if (!to || !to.includes("@")) {
-        return res.status(400).json({ success: false, error: "Indirizzo email destinatario non valido." });
-      }
-
-      // If cvBase64 is not provided in payload, look up in server's stored CV files
-      if (!cvBase64) {
-        const storedFiles = (db as any).cv_files;
-        if (storedFiles) {
-          const fileEntry = storedFiles[email_data?.userId || "user_blunero90"] || Object.values(storedFiles)[0];
-          if (fileEntry && (fileEntry as any).base64Data) {
-            cvBase64 = (fileEntry as any).base64Data;
-            if ((fileEntry as any).fileName) {
-              cvFilename = (fileEntry as any).fileName;
-            }
-          }
-        }
-      }
-
-      // Clean base64 header if present (e.g. data:application/pdf;base64,...)
-      if (cvBase64 && typeof cvBase64 === "string" && cvBase64.includes(";base64,")) {
-        cvBase64 = cvBase64.split(";base64,")[1];
-      }
-
-      // Ensure filename ends with .pdf
-      if (cvFilename && !cvFilename.toLowerCase().endsWith(".pdf")) {
-        cvFilename = `${cvFilename}.pdf`;
-      }
-
-      // STRICT RULE: Nessun CV = nessuna email
-      const hasStoredCV = Boolean(
-        cvPath || 
-        cvBase64 || 
-        (db.user_profiles && db.user_profiles.some((p: any) => p.cv_file_path || p.cv_short_summary)) ||
-        ((db as any).cv_files && Object.keys((db as any).cv_files).length > 0)
-      );
-
-      if (!hasStoredCV && !cvPath && !cvBase64) {
-        return res.status(400).json({
-          success: false,
-          error: "Invio bloccato: nessun Curriculum Vitae presente o allegato. L'allegato CV è obbligatorio per l'invio.",
-        });
-      }
-
-      // Blacklist check
-      const normalizedTo = to.toLowerCase();
-      const domain = normalizedTo.split("@")[1];
-      const matchedBlacklist = (db.blacklist || []).find((entry: any) => {
-        if (entry.type === "email") {
-          return entry.pattern.toLowerCase() === normalizedTo;
-        }
-        const entryDomain = entry.pattern.toLowerCase().replace(/^@/, "");
-        return domain === entryDomain || domain?.endsWith("." + entryDomain);
-      });
-
-      if (matchedBlacklist) {
-        const reason =
-          matchedBlacklist.type === "domain"
-            ? `Il dominio @${matchedBlacklist.pattern} è nella Blacklist`
-            : `L'indirizzo ${matchedBlacklist.pattern} è nella Blacklist`;
-        return res.status(403).json({
-          success: false,
-          error: `Invio bloccato: ${reason}. Questo contatto non riceverà candidature.`,
-          blacklisted: true,
-          matchedRule: matchedBlacklist,
-        });
-      }
-
-      // Deduplication check
-      const alreadySent = (db.sent_emails || []).find((s) => s.email?.toLowerCase() === normalizedTo);
-      if (alreadySent && !forceSend) {
-        return res.status(409).json({
-          success: false,
-          error: `Questa azienda (${alreadySent.company_name || normalizedTo}) è già stata contattata il ${new Date(alreadySent.sent_at).toLocaleDateString("it-IT")}.`,
-          duplicate: true,
-          lastSent: alreadySent.sent_at,
-        });
-      }
-
-      // Construct MIME Message with CV Attachment
-      const attachmentFilename = cvFilename || (cvPath ? path.basename(cvPath) : "Curriculum_Vitae.pdf");
-      const attachmentData = cvBase64 || "JVBERi0xLjQKJcTl8uXr...CV_ATTACHMENT_VERIFIED...";
-      
-      const rawMime = buildRfc2822MimeMessage({
-        to: normalizedTo,
-        subject,
-        bodyHtml: body,
-        attachmentFilename,
-        attachmentBase64: attachmentData,
-        attachmentMimeType: cvMimeType || "application/pdf",
-      });
-
-      // Store in sent_emails
-      const newSent = {
-        id: `sent_${Date.now()}`,
-        company_id: email_data?.company_id || null,
-        company_name: email_data?.company_name || to.split("@")[0] || "Azienda",
-        email: normalizedTo,
-        subject,
-        body,
-        cv_version: "1.0",
-        has_attachment: true,
-        attachment_name: attachmentFilename,
-        status: "sent",
-        sent_at: new Date().toISOString(),
-      };
-
-      db.sent_emails.unshift(newSent);
-      saveDb(db);
-
-      return res.json({
-        success: true,
-        message: `Email inviata con successo con allegato CV (${attachmentFilename}) a ${normalizedTo}`,
-        sent_id: newSent.id,
-        raw_mime_length: rawMime.length,
-      });
-    }
-
-    return res.json({ success: true });
+    return res.status(409).json({ success: false, error: 'Autorizza Gmail nella sessione corrente. Nessuna email è stata inviata dal server.' });
   });
 
   // Vite Middleware / Static serving
-  if (process.env.NODE_ENV !== "production") {
+  if (options.serveFrontend !== false && process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
-  } else {
+  } else if (options.serveFrontend !== false) {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
@@ -1662,9 +1369,9 @@ Rispondi con un oggetto JSON valido:
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Job Outreach Assistant server running on http://0.0.0.0:${PORT} with Google Gemini API`);
-  });
+  return app;
 }
-
-startServer();
+if (process.argv[1] && ['server.ts', 'server.cjs'].includes(path.basename(process.argv[1]))) {
+  const port = Number(process.env.PORT || 3000);
+  createApplication().then(app => app.listen(port, '0.0.0.0', () => console.log(`Job Outreach Assistant listening on ${port}`)));
+}

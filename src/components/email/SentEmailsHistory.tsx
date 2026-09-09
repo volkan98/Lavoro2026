@@ -1,3 +1,4 @@
+import { requireUid } from '@/lib/api/client';
 import { useState, useEffect } from 'react';
 import { aiAgent } from '@/lib/api/ai-agent';
 import { useCVContext } from '@/contexts/CVContext';
@@ -60,7 +61,7 @@ export function SentEmailsHistory() {
   const fetchSentEmails = async () => {
     setIsLoading(true);
     try {
-      const activeUserId = user?.id || 'user_blunero90';
+      const activeUserId = requireUid(user?.id);
       const emails = await aiAgent.getSentEmails(activeUserId);
       const list = Array.isArray(emails) ? emails : [];
       setSentEmails(list);
@@ -122,7 +123,7 @@ export function SentEmailsHistory() {
 
   const handleDelete = async (id: string) => {
     try {
-      const activeUserId = user?.id || 'user_blunero90';
+      const activeUserId = requireUid(user?.id);
       const res = await aiAgent.deleteSentEmail(id, activeUserId);
       if (!res.success) throw new Error(res.error);
 

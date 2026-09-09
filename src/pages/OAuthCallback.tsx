@@ -1,3 +1,4 @@
+import { apiFetch } from '@/lib/api/client';
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -29,7 +30,7 @@ export default function OAuthCallback() {
       }
 
       try {
-        const response = await fetch('/api/oauth/callback', {
+        const response = await apiFetch('/api/oauth/callback', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ code, provider: state }),

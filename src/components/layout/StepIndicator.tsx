@@ -1,3 +1,4 @@
+import { useUserProfile } from '@/hooks/useUserProfile';
 import * as React from 'react';
 import { Check, Upload, FileText, Building2, Mail, History, Rocket } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -27,11 +28,12 @@ interface StepIndicatorProps {
 export function StepIndicator({ currentStep, onStepClick }: StepIndicatorProps) {
   const { cvData, cvFileState, sintesiBreve, aziendeSelezionate, logInvii } = useCVContext();
 
+  const { hasSavedCV } = useUserProfile();
   // Determine actual completion of each step
   const isStepCompleted = (stepId: number): boolean => {
     switch (stepId) {
       case 0:
-        return Boolean(cvFileState?.fileName || cvData?.nome || cvData?.cognome || sintesiBreve);
+        return hasSavedCV;
       case 1:
         return Boolean(sintesiBreve || cvData?.profilo || (cvData?.competenze && cvData.competenze.length > 0));
       case 2:

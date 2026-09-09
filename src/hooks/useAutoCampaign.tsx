@@ -1,3 +1,6 @@
+import { scopedStorageKey } from '@/lib/api/client';
+import { requireUid } from '@/lib/api/client';
+import { apiFetch } from '@/lib/api/client';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from '@/hooks/useAuth';
 import { useToast } from '@/hooks/use-toast';
@@ -107,12 +110,12 @@ export function useAutoCampaign() {
   const { cvData, sintesiBreve, cvFileState, addLogInvio } = useCVContext();
   const { profile } = useUserProfile();
 
-  const userId = user?.id || 'user_blunero90';
+  const userId = requireUid(user?.id);
 
   // Synchronous cache hydration
   const [campaign, setCampaign] = useState<Campaign | null>(() => {
     try {
-      const stored = localStorage.getItem(LOCAL_STORAGE_CAMPAIGN_KEY);
+      const stored = localStorage.getItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY));
       if (stored) {
         const parsed = JSON.parse(stored);
         if (parsed && typeof parsed === 'object' && parsed.id) return parsed;
@@ -125,7 +128,7 @@ export function useAutoCampaign() {
 
   const [events, setEvents] = useState<CampaignEvent[]>(() => {
     try {
-      const stored = localStorage.getItem(LOCAL_STORAGE_EVENTS_KEY);
+      const stored = localStorage.getItem(scopedStorageKey(LOCAL_STORAGE_EVENTS_KEY));
       if (stored) {
         const parsed = JSON.parse(stored);
         if (Array.isArray(parsed)) return parsed;
@@ -138,7 +141,7 @@ export function useAutoCampaign() {
 
   const [queueItems, setQueueItems] = useState<QueueItem[]>(() => {
     try {
-      const stored = localStorage.getItem(LOCAL_STORAGE_QUEUE_KEY);
+      const stored = localStorage.getItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY));
       if (stored) {
         const parsed = JSON.parse(stored);
         if (Array.isArray(parsed)) return parsed;
@@ -202,7 +205,7 @@ export function useAutoCampaign() {
     setEvents((prev) => {
       const updated = [newEvt, ...prev].slice(0, 100);
       try {
-        localStorage.setItem(LOCAL_STORAGE_EVENTS_KEY, JSON.stringify(updated));
+        localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_EVENTS_KEY), JSON.stringify(updated));
       } catch {}
       return updated;
     });
@@ -215,7 +218,7 @@ export function useAutoCampaign() {
       try {
         const ctrl = new AbortController();
         const timeoutId = setTimeout(() => ctrl.abort(), 2000);
-        const res = await fetch('/api/campaigns', { signal: ctrl.signal });
+        const res = await apiFetch('/api/campaigns', { signal: ctrl.signal });
         clearTimeout(timeoutId);
 
         if (res.ok) {
@@ -223,13 +226,13 @@ export function useAutoCampaign() {
           if (json?.data) {
             setCampaign(json.data);
             try {
-              localStorage.setItem(LOCAL_STORAGE_CAMPAIGN_KEY, JSON.stringify(json.data));
+              localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY), JSON.stringify(json.data));
             } catch {}
           }
           if (Array.isArray(json?.events) && json.events.length > 0) {
             setEvents(json.events);
             try {
-              localStorage.setItem(LOCAL_STORAGE_EVENTS_KEY, JSON.stringify(json.events));
+              localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_EVENTS_KEY), JSON.stringify(json.events));
             } catch {}
           }
         }
@@ -241,7 +244,7 @@ export function useAutoCampaign() {
       try {
         const ctrl = new AbortController();
         const timeoutId = setTimeout(() => ctrl.abort(), 2000);
-        const qRes = await fetch('/api/campaign-queue', { signal: ctrl.signal });
+        const qRes = await apiFetch('/api/campaign-queue', { signal: ctrl.signal });
         clearTimeout(timeoutId);
 
         if (qRes.ok) {
@@ -249,7 +252,7 @@ export function useAutoCampaign() {
           if (Array.isArray(qJson?.data)) {
             setQueueItems(qJson.data);
             try {
-              localStorage.setItem(LOCAL_STORAGE_QUEUE_KEY, JSON.stringify(qJson.data));
+              localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY), JSON.stringify(qJson.data));
             } catch {}
           }
         }
@@ -266,7 +269,7 @@ export function useAutoCampaign() {
           const campData = campSnap.data() as Campaign;
           setCampaign((prev) => prev || campData);
           try {
-            localStorage.setItem(LOCAL_STORAGE_CAMPAIGN_KEY, JSON.stringify(campData));
+            localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY), JSON.stringify(campData));
           } catch {}
         }
       } catch (e) {
@@ -289,7 +292,7 @@ export function useAutoCampaign() {
   useEffect(() => {
     const handleQueueUpdate = () => {
       try {
-        const stored = localStorage.getItem(LOCAL_STORAGE_QUEUE_KEY);
+        const stored = localStorage.getItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY));
         if (stored) {
           const parsed = JSON.parse(stored);
           if (Array.isArray(parsed)) setQueueItems(parsed);
@@ -310,13 +313,13 @@ export function useAutoCampaign() {
     setQueueItems((prev) => {
       const updated = prev.map((item) => (item.id === id ? { ...item, ...updates } : item));
       try {
-        localStorage.setItem(LOCAL_STORAGE_QUEUE_KEY, JSON.stringify(updated));
+        localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY), JSON.stringify(updated));
       } catch {}
       return updated;
     });
 
     // Sync with server
-    fetch(`/api/campaign-queue/${id}`, {
+    apiFetch(`/api/campaign-queue/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updates),
@@ -333,14 +336,14 @@ export function useAutoCampaign() {
         updated_at: new Date().toISOString(),
       };
       try {
-        localStorage.setItem(LOCAL_STORAGE_CAMPAIGN_KEY, JSON.stringify(updated));
+        localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY), JSON.stringify(updated));
       } catch {}
       return updated;
     });
 
     // Sync with server
     if (campaign?.id) {
-      fetch(`/api/campaigns/${campaign.id}`, {
+      apiFetch(`/api/campaigns/${campaign.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates),
@@ -407,9 +410,9 @@ export function useAutoCampaign() {
     setQueueItems([]);
 
     try {
-      localStorage.setItem(LOCAL_STORAGE_CAMPAIGN_KEY, JSON.stringify(newCamp));
-      localStorage.setItem(LOCAL_STORAGE_EVENTS_KEY, JSON.stringify([newEvent]));
-      localStorage.setItem(LOCAL_STORAGE_QUEUE_KEY, JSON.stringify([]));
+      localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY), JSON.stringify(newCamp));
+      localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_EVENTS_KEY), JSON.stringify([newEvent]));
+      localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY), JSON.stringify([]));
     } catch {}
 
     // Firestore sync
@@ -419,7 +422,7 @@ export function useAutoCampaign() {
     } catch {}
 
     // Server sync
-    fetch('/api/campaigns', {
+    apiFetch('/api/campaigns', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newCamp),
@@ -482,12 +485,12 @@ export function useAutoCampaign() {
     setEvents([]);
     setQueueItems([]);
     try {
-      localStorage.removeItem(LOCAL_STORAGE_CAMPAIGN_KEY);
-      localStorage.removeItem(LOCAL_STORAGE_EVENTS_KEY);
-      localStorage.removeItem(LOCAL_STORAGE_QUEUE_KEY);
+      localStorage.removeItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY));
+      localStorage.removeItem(scopedStorageKey(LOCAL_STORAGE_EVENTS_KEY));
+      localStorage.removeItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY));
     } catch {}
 
-    fetch('/api/campaigns', { method: 'DELETE' }).catch(() => {});
+    apiFetch('/api/campaigns', { method: 'DELETE' }).catch(() => {});
 
     try {
       const campDocRef = doc(db, 'users', userId, 'campaigns', 'current');
@@ -586,7 +589,7 @@ export function useAutoCampaign() {
 
           let currentBlacklist: BlacklistEntry[] = [];
           try {
-            const rawBl = localStorage.getItem(STORAGE_KEY_BLACKLIST);
+            const rawBl = localStorage.getItem(scopedStorageKey(STORAGE_KEY_BLACKLIST));
             if (rawBl) currentBlacklist = JSON.parse(rawBl);
           } catch {}
 
@@ -640,10 +643,10 @@ export function useAutoCampaign() {
               const updatedQueue = [...queueItems, ...newValidItems];
               setQueueItems(updatedQueue);
               try {
-                localStorage.setItem(LOCAL_STORAGE_QUEUE_KEY, JSON.stringify(updatedQueue));
+                localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY), JSON.stringify(updatedQueue));
               } catch {}
 
-              fetch('/api/campaign-queue', {
+              apiFetch('/api/campaign-queue', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(newValidItems),
@@ -691,7 +694,7 @@ export function useAutoCampaign() {
           // Rule: Check blacklist again before sending
           let currentBlacklist: BlacklistEntry[] = [];
           try {
-            const rawBl = localStorage.getItem(STORAGE_KEY_BLACKLIST);
+            const rawBl = localStorage.getItem(scopedStorageKey(STORAGE_KEY_BLACKLIST));
             if (rawBl) currentBlacklist = JSON.parse(rawBl);
           } catch {}
 
@@ -750,7 +753,7 @@ export function useAutoCampaign() {
 
           const candidateName = cvData?.nome
             ? `${cvData.nome} ${cvData?.cognome || ''}`.trim()
-            : profile?.full_name || 'Candidato';
+            : profile?.full_name || '';
 
           // Try AI generation
           let subject = '';
@@ -775,7 +778,7 @@ export function useAutoCampaign() {
               cvData || {},
               styleVariant,
               undefined,
-              'immediata'
+              ''
             );
 
             if (emailRes.success && emailRes.data) {
@@ -824,34 +827,7 @@ export function useAutoCampaign() {
               sendSuccess = true;
               logEvent('gmail_api', `✅ Candidatura inviata via Gmail API con allegato CV PDF (${attachment.filename}) a ${nextItem.company_name}`);
             } else {
-              // 2. Server email proxy fallback
-              const serverRes = await fetch('/api/email-oauth', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  action: 'send_email',
-                  provider: 'gmail',
-                  email_data: {
-                    to: nextItem.company_email,
-                    subject,
-                    body: bodyText,
-                    companyName: nextItem.company_name,
-                    cv_filename: attachment.filename,
-                    cv_base64: attachment.base64,
-                    cv_mimetype: attachment.mimeType,
-                    attachment: attachment,
-                    attachment_data: attachment,
-                    userId,
-                  },
-                }),
-              });
-              const serverJson = await serverRes.json();
-              if (serverJson.success) {
-                sendSuccess = true;
-                logEvent('server_send', `✅ Candidatura inviata con allegato CV PDF (${attachment.filename}) a ${nextItem.company_name}`);
-              } else {
-                sendError = serverJson.error || gmailRes.error || 'Invio non riuscito';
-              }
+              sendError = gmailRes.error || 'Invio Gmail non riuscito';
             }
           } catch (e: any) {
             sendError = e.message || 'Errore di connessione durante l\'invio';
@@ -905,7 +881,7 @@ export function useAutoCampaign() {
               );
             }
 
-            aiAgent.recordSentEmail(
+            const recorded = await aiAgent.recordSentEmail(
               nextItem.id,
               nextItem.company_name,
               nextItem.company_email,
@@ -914,16 +890,18 @@ export function useAutoCampaign() {
               attachment.filename,
               userId
             );
+            if (!recorded.success) {
+              updateCampaignState({ status: 'paused', pause_reason: 'Email inviata, ma storico non salvato in Firestore. Verifica prima di riprendere.' });
+              logEvent('error', recorded.error || 'Errore salvataggio storico');
+            }
 
             if (addLogInvio) {
               addLogInvio({
                 id: `log_${Date.now()}`,
-                aziendaId: nextItem.id,
-                nomeAzienda: nextItem.company_name,
-                email: nextItem.company_email,
-                dataInvio: new Date().toLocaleDateString('it-IT'),
-                oraInvio: new Date().toLocaleTimeString('it-IT'),
-                stato: 'inviata',
+                destinatario: nextItem.company_name,
+                emailDestinatario: nextItem.company_email,
+                data: new Date().toISOString(),
+                stato: 'inviato',
                 oggetto: subject,
                 allegati: [attachment.filename],
               });

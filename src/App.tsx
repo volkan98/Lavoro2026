@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { AuthProvider } from "@/hooks/useAuth";
 import { CVProvider } from "@/contexts/CVContext";
+import { UserProfileProvider } from '@/hooks/useUserProfile';
 import Index from "./pages/Index";
 import Auth from "./pages/Auth";
 import OAuthCallback from "./pages/OAuthCallback";
@@ -15,6 +16,7 @@ const queryClient = new QueryClient();
 const App = () => (
   <QueryClientProvider client={queryClient}>
     <AuthProvider>
+      <UserProfileProvider>
       <CVProvider>
         <TooltipProvider>
           <Toaster />
@@ -30,6 +32,7 @@ const App = () => (
           </BrowserRouter>
         </TooltipProvider>
       </CVProvider>
+      </UserProfileProvider>
     </AuthProvider>
   </QueryClientProvider>
 );
