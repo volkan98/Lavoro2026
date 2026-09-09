@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["server.ts", "server/**/*.ts", "src/lib/cvNormalizer.ts", "src/types/cv.ts"]
+}

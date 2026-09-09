@@ -27,61 +27,21 @@ import {
   Loader2
 } from 'lucide-react';
 
-function getPermessoGText(cvData: any): string {
-  if (cvData?.statoPermesso && cvData.statoPermesso.trim()) {
-    return cvData.statoPermesso;
-  }
-  if (cvData?.permessoG === 'In possesso' || cvData?.permessoG === true) {
-    return 'In possesso di Permesso G (Frontalieri Svizzera)';
-  }
-  return 'Idoneo al rilascio immediato di Permesso G (Cittadino UE / Frontalieri Svizzera)';
-}
-
-function generateSintesiBreve(cvData: any): string {
-  const anniEsperienza = cvData.esperienze?.length > 0 ? 
-    `con ${cvData.esperienze.length + 3} anni di esperienza` : '';
-  const permesso = getPermessoGText(cvData);
-  
-  return `[PRIORITÀ SVIZZERA - ${permesso.toUpperCase()}] • Professionista ${anniEsperienza} nel settore ${cvData.esperienze?.[0]?.azienda?.includes('Meccaniche') ? 'metalmeccanico' : 'industriale'}, con competenze chiave in ${cvData.competenze?.slice(0, 3).join(', ')}. Piena disponibilità immediata per assunzione in Canton Ticino, Grigioni e Svizzera.`;
-}
-
-function generateSintesiCompleta(cvData: any): string {
-  const permesso = getPermessoGText(cvData);
-  return `• **Permesso di Lavoro Svizzera (Prioritario)**: ${permesso} – Nessun ostacolo burocratico all'assunzione da parte di aziende svizzere (Canton Ticino / Grigioni / Svizzera interna).
-
-• **Profilo professionale**: ${cvData.profilo || 'Professionista qualificato con esperienza consolidata'}
-
-• **Esperienza lavorativa**: ${cvData.esperienze?.length || 0} ruoli ricoperti, ultimo incarico come ${cvData.esperienze?.[0]?.ruolo || 'Specialista'} presso ${cvData.esperienze?.[0]?.azienda || 'Azienda'}
-
-• **Competenze chiave**: ${(cvData.competenze || []).join(', ')}
-
-• **Formazione**: ${cvData.istruzione?.[0]?.titolo || 'Diploma / Laurea'} - ${cvData.istruzione?.[0]?.istituto || 'Istituto'}
-
-• **Lingue**: ${(cvData.lingue || []).map((l: any) => typeof l === 'string' ? l : `${l.lingua || ''}${l.livello ? ` (${l.livello})` : ''}`).filter(Boolean).join(', ') || 'Italiano (Madrelingua)'}
-
-• **Disponibilità & Mobilità**: Immediata, residente a ${cvData.citta || 'zona frontaliera'} con disponibilità agli spostamenti verso la Svizzera`;
-}
+import { summarizeCv, hasCvData } from '@/lib/cvNormalizer';
 
 export function CVSummary() {
   const { cvData, setCvData, setSintesiBreve, setSintesiCompleta, sintesiBreve, sintesiCompleta, setCurrentStep } = useCVContext();
-  const { saveProfile, isSaving } = useUserProfile();
+  const { saveProfile, isSaving, isLoading, syncError } = useUserProfile();
   const { toast } = useToast();
-  const [editedData, setEditedData] = useState(cvData);
+  const editedData = cvData;
+  const setEditedData = setCvData;
   const [newCompetenza, setNewCompetenza] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
 
-  useEffect(() => {
-    if (cvData && !sintesiBreve) {
-      setSintesiBreve(generateSintesiBreve(cvData));
-      setSintesiCompleta(generateSintesiCompleta(cvData));
-    }
-  }, [cvData, sintesiBreve, setSintesiBreve, setSintesiCompleta]);
 
-  useEffect(() => {
-    setEditedData(cvData);
-  }, [cvData]);
+  if (isLoading) return <p role="status">Recupero dei dati del CV…</p>;
 
-  if (!cvData || !editedData) {
+  if (!hasCvData(cvData) || !editedData) {
     return (
       <div className="text-center py-12">
         <p className="text-muted">Nessun CV caricato. Torna al primo step.</p>
@@ -95,9 +55,9 @@ export function CVSummary() {
 
   const handleRegenerate = async () => {
     setIsGenerating(true);
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    setSintesiBreve(generateSintesiBreve(editedData));
-    setSintesiCompleta(generateSintesiCompleta(editedData));
+    const summaries = summarizeCv(editedData);
+    setSintesiBreve(summaries.sintesiBreve);
+    setSintesiCompleta(summaries.sintesiCompleta);
     setIsGenerating(false);
   };
 
@@ -135,7 +95,8 @@ export function CVSummary() {
       });
     }
     
-    setCurrentStep(2);
+    if (result.success) setCurrentStep(2);
+    else toast({ title: 'Salvataggio non riuscito', description: result.error, variant: 'destructive' });
   };
 
   return (
@@ -149,6 +110,7 @@ export function CVSummary() {
         </p>
       </div>
 
+      {syncError && <p role="alert" className="text-destructive">{syncError}</p>}
       <Tabs defaultValue="dati" className="w-full">
         <TabsList className="grid w-full grid-cols-2">
           <TabsTrigger value="dati">Dati Personali</TabsTrigger>
@@ -156,68 +118,14 @@ export function CVSummary() {
         </TabsList>
 
         <TabsContent value="dati" className="space-y-4 mt-4">
-          {/* Card Prioritaria Permesso G Svizzera */}
-          <Card className="border-emerald-500/40 bg-emerald-50/50 dark:bg-emerald-950/20 shadow-sm">
-            <CardHeader className="pb-2">
-              <div className="flex items-center justify-between flex-wrap gap-2">
-                <CardTitle className="text-base md:text-lg flex items-center gap-2 text-emerald-800 dark:text-emerald-300">
-                  <span className="text-xl">🇨🇭</span>
-                  <span>Permesso G (Frontalieri Svizzera)</span>
-                  <Badge variant="default" className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold">
-                    Priorità 1
-                  </Badge>
-                </CardTitle>
-                <span className="text-xs font-medium text-emerald-700 dark:text-emerald-400 bg-emerald-100 dark:bg-emerald-900/50 px-2.5 py-0.5 rounded-full">
-                  Inserito in cima alla sintesi
-                </span>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-3 pt-1">
-              <p className="text-xs text-muted-foreground">
-                Questa informazione è collocata in prima posizione sia nella sintesi breve sia in quella completa per rassicurare immediatamente le aziende svizzere sulla facilità di assunzione.
-              </p>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div>
-                  <label className="text-xs font-medium text-foreground">Stato Permesso G</label>
-                  <select
-                    value={editedData.permessoG === 'In possesso' || editedData.permessoG === true ? 'In possesso' : 'Idoneo'}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      const statoStr = val === 'In possesso' 
-                        ? 'In possesso di Permesso G (Frontalieri Svizzera)' 
-                        : 'Idoneo al rilascio immediato di Permesso G (Cittadino UE / Frontalieri Svizzera)';
-                      const updated = {
-                        ...editedData,
-                        permessoG: val,
-                        statoPermesso: statoStr
-                      };
-                      setEditedData(updated);
-                      setSintesiBreve(generateSintesiBreve(updated));
-                      setSintesiCompleta(generateSintesiCompleta(updated));
-                    }}
-                    className="mt-1 w-full flex h-9 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                  >
-                    <option value="In possesso">In possesso di Permesso G (Frontalieri Svizzera)</option>
-                    <option value="Idoneo">Idoneo al rilascio immediato (Cittadino UE / Frontaliere)</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs font-medium text-foreground">Dettaglio / Dicitura Sintesi</label>
-                  <Input
-                    value={editedData.statoPermesso || getPermessoGText(editedData)}
-                    onChange={(e) => {
-                      const updated = { ...editedData, statoPermesso: e.target.value };
-                      setEditedData(updated);
-                      setSintesiBreve(generateSintesiBreve(updated));
-                      setSintesiCompleta(generateSintesiCompleta(updated));
-                    }}
-                    className="mt-1"
-                    placeholder="Es. In possesso di Permesso G valido"
-                  />
-                </div>
-              </div>
-            </CardContent>
-          </Card>
+          <Card><CardHeader><CardTitle>Permesso G</CardTitle></CardHeader><CardContent>
+            <label className="text-sm">Stato dichiarato nel CV</label>
+            <Input aria-label="Permesso G" placeholder="Non presente nel CV"
+              value={typeof editedData.permessoG === 'boolean' ? (editedData.permessoG ? 'In possesso' : 'Non in possesso') : editedData.permessoG || ''}
+              onChange={e => setEditedData({ ...editedData, permessoG: e.target.value })} />
+            <Input aria-label="Dettaglio permesso" placeholder="Non presente nel CV" value={editedData.statoPermesso || ''}
+              onChange={e => setEditedData({ ...editedData, statoPermesso: e.target.value })} />
+          </CardContent></Card>
 
           {/* Info Personali */}
           <Card>
@@ -231,7 +139,7 @@ export function CVSummary() {
               <div>
                 <label className="text-sm font-medium text-foreground">Nome</label>
                 <Input
-                  value={editedData.nome}
+                  aria-label="nome" placeholder="Non presente nel CV" value={editedData.nome || ""}
                   onChange={e => setEditedData({ ...editedData, nome: e.target.value })}
                   className="mt-1"
                 />
@@ -239,7 +147,7 @@ export function CVSummary() {
               <div>
                 <label className="text-sm font-medium text-foreground">Cognome</label>
                 <Input
-                  value={editedData.cognome}
+                  aria-label="cognome" placeholder="Non presente nel CV" value={editedData.cognome || ""}
                   onChange={e => setEditedData({ ...editedData, cognome: e.target.value })}
                   className="mt-1"
                 />
@@ -250,7 +158,7 @@ export function CVSummary() {
                 </label>
                 <Input
                   type="email"
-                  value={editedData.email}
+                  aria-label="email" placeholder="Non presente nel CV" value={editedData.email || ""}
                   onChange={e => setEditedData({ ...editedData, email: e.target.value })}
                   className="mt-1"
                 />
@@ -260,7 +168,7 @@ export function CVSummary() {
                   <Phone className="h-4 w-4" /> Telefono
                 </label>
                 <Input
-                  value={editedData.telefono}
+                  aria-label="telefono" placeholder="Non presente nel CV" value={editedData.telefono || ""}
                   onChange={e => setEditedData({ ...editedData, telefono: e.target.value })}
                   className="mt-1"
                 />
@@ -279,13 +187,19 @@ export function CVSummary() {
               <div>
                 <label className="text-sm font-medium text-foreground">CAP</label>
                 <Input
-                  value={editedData.cap}
+                  aria-label="cap" placeholder="Non presente nel CV" value={editedData.cap || ""}
                   onChange={e => setEditedData({ ...editedData, cap: e.target.value })}
                   className="mt-1"
                 />
               </div>
             </CardContent>
           </Card>
+
+          <Card><CardHeader><CardTitle>Altri dati personali</CardTitle></CardHeader><CardContent className="grid gap-4 md:grid-cols-3">
+            {([['indirizzo', 'Indirizzo'], ['dataNascita', 'Data di nascita'], ['patente', 'Patente']] as const).map(([field, label]) => <label key={field}>{label}
+              <Input aria-label={label} placeholder="Non presente nel CV" value={editedData[field] || ''} onChange={e => setEditedData({ ...editedData, [field]: e.target.value })} />
+            </label>)}
+          </CardContent></Card>
 
           {/* Profilo */}
           <Card>
@@ -357,7 +271,7 @@ export function CVSummary() {
                       {exp.dataInizio} - {exp.dataFine}
                     </Badge>
                   </div>
-                  <p className="text-sm text-muted">{exp.descrizione}</p>
+                  <p className="text-sm text-muted whitespace-pre-wrap">{exp.descrizione}</p>
                 </div>
               ))}
               {(!editedData.esperienze || editedData.esperienze.length === 0) && (
@@ -380,8 +294,9 @@ export function CVSummary() {
                   <div>
                     <p className="font-medium text-foreground">{edu.titolo}</p>
                     <p className="text-sm text-muted">{edu.istituto}</p>
+                    {edu.descrizione && <p className="text-sm whitespace-pre-wrap">{edu.descrizione}</p>}
                   </div>
-                  <Badge variant="outline">{edu.anno}</Badge>
+                  <Badge variant="outline">{[edu.dataInizio, edu.dataFine].filter(Boolean).join(" – ") || edu.anno || "Date non presenti"}</Badge>
                 </div>
               ))}
               {(!editedData.istruzione || editedData.istruzione.length === 0) && (
@@ -411,17 +326,14 @@ export function CVSummary() {
               )}
             </CardContent>
           </Card>
+          <Card><CardHeader><CardTitle>Certificazioni e altre informazioni</CardTitle></CardHeader><CardContent className="space-y-2">
+            {(editedData.certificazioni || []).map((item, i) => <p key={`cert-${i}`}>{item}</p>)}
+            {(editedData.altreInformazioni || []).map((item, i) => <p key={`other-${i}`}>{item}</p>)}
+            {!editedData.certificazioni?.length && !editedData.altreInformazioni?.length && <p>Non presenti nel CV.</p>}
+          </CardContent></Card>
         </TabsContent>
 
         <TabsContent value="sintesi" className="space-y-4 mt-4">
-          {/* Badge Informativo Priorità Permesso G */}
-          <div className="flex items-center gap-2 p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-lg text-emerald-800 dark:text-emerald-300 text-xs md:text-sm font-medium">
-            <span className="text-base">🇨🇭</span>
-            <span>
-              <strong>Permesso G Prioritario:</strong> L&apos;idoneità o possesso del Permesso G (Frontalieri Svizzera) è inserita come prima informazione per attirare le aziende in Svizzera (Ticino, Grigioni).
-            </span>
-          </div>
-
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-lg">Sintesi Breve</CardTitle>

@@ -14,6 +14,7 @@ export interface CVData {
   istruzione: Istruzione[];
   lingue: Lingua[];
   certificazioni?: string[];
+  altreInformazioni?: string[];
   targetRole?: string;
   permessoG?: boolean | string;
   statoPermesso?: string;
@@ -35,6 +36,9 @@ export interface Istruzione {
   titolo: string;
   istituto: string;
   anno: string;
+  dataInizio?: string;
+  dataFine?: string;
+  descrizione?: string;
 }
 
 export interface Lingua {

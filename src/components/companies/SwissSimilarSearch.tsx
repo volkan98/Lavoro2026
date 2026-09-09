@@ -1,3 +1,4 @@
+import { scopedStorageKey } from '@/lib/api/client';
 import { useMemo, useState } from 'react';
 import { useCVContext } from '@/contexts/CVContext';
 import { aiAgent, Company } from '@/lib/api/ai-agent';
@@ -60,7 +61,7 @@ function formatDuration(ms: number): string {
 
 function loadSet(key: string): Set<string> {
   try {
-    const raw = localStorage.getItem(key);
+    const raw = localStorage.getItem(scopedStorageKey(key));
     const parsed = raw ? JSON.parse(raw) : [];
     return new Set<string>(Array.isArray(parsed) ? parsed : []);
   } catch {
@@ -70,7 +71,7 @@ function loadSet(key: string): Set<string> {
 
 function saveSet(key: string, set: Set<string>) {
   try {
-    localStorage.setItem(key, JSON.stringify([...set]));
+    localStorage.setItem(scopedStorageKey(key), JSON.stringify([...set]));
   } catch {
     /* ignore */
   }
@@ -129,7 +130,7 @@ export function SwissSimilarSearch() {
 
   const [results, setResults] = useState<ScoredAzienda[]>(() => {
     try {
-      const raw = localStorage.getItem(RESULTS_KEY);
+      const raw = localStorage.getItem(scopedStorageKey(RESULTS_KEY));
       const parsed = raw ? JSON.parse(raw) : [];
       return Array.isArray(parsed) ? parsed : [];
     } catch {
@@ -141,7 +142,7 @@ export function SwissSimilarSearch() {
   const persistResults = (list: ScoredAzienda[]) => {
     setResults(list);
     try {
-      localStorage.setItem(RESULTS_KEY, JSON.stringify(list));
+      localStorage.setItem(scopedStorageKey(RESULTS_KEY), JSON.stringify(list));
     } catch {
       /* ignore */
     }

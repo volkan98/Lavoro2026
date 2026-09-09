@@ -1,3 +1,5 @@
+import { scopedStorageKey } from '@/lib/api/client';
+import { requireUid } from '@/lib/api/client';
 import { useState, useEffect, useCallback } from 'react';
 import { useCVContext } from '@/contexts/CVContext';
 import { useAuth } from '@/hooks/useAuth';
@@ -141,11 +143,11 @@ export function EmailComposer() {
   const COOLDOWN_THRESHOLD = 8; // Dopo quante email suggerire pausa
   
   const [sendTimestamps, setSendTimestamps] = useState<number[]>(() => {
-    const saved = localStorage.getItem('email_send_timestamps');
+    const saved = localStorage.getItem(scopedStorageKey('email_send_timestamps'));
     return saved ? JSON.parse(saved) : [];
   });
   const [cooldownUntil, setCooldownUntil] = useState<number | null>(() => {
-    const saved = localStorage.getItem('email_cooldown_until');
+    const saved = localStorage.getItem(scopedStorageKey('email_cooldown_until'));
     return saved ? Number(saved) : null;
   });
   const [cooldownDismissed, setCooldownDismissed] = useState(false);
@@ -158,14 +160,14 @@ export function EmailComposer() {
     if (cleaned.length !== sendTimestamps.length) {
       setSendTimestamps(cleaned);
     }
-    localStorage.setItem('email_send_timestamps', JSON.stringify(cleaned));
+    localStorage.setItem(scopedStorageKey('email_send_timestamps'), JSON.stringify(cleaned));
   }, [sendTimestamps]);
 
   useEffect(() => {
     if (cooldownUntil) {
-      localStorage.setItem('email_cooldown_until', String(cooldownUntil));
+      localStorage.setItem(scopedStorageKey('email_cooldown_until'), String(cooldownUntil));
     } else {
-      localStorage.removeItem('email_cooldown_until');
+      localStorage.removeItem(scopedStorageKey('email_cooldown_until'));
     }
   }, [cooldownUntil]);
 
@@ -311,7 +313,7 @@ export function EmailComposer() {
         },
         emailStyle,
         undefined,
-        'immediata'
+        ''
       );
 
       if (result.data) {
@@ -330,13 +332,13 @@ export function EmailComposer() {
     } catch (error: any) {
       console.warn('Notice in generating email:', error);
       // Factual, concise fallback template (100-160 words, clean signature on separate lines)
-      const fullName = [cvData.nome, cvData.cognome].filter(Boolean).join(' ') || profile?.full_name || 'Candidato';
-      const role = cvData.profilo || profile?.title || 'Professionista qualificato';
+      const fullName = [cvData.nome, cvData.cognome].filter(Boolean).join(' ') || profile?.full_name || '';
+      const role = cvData.profilo || profile?.title || '';
       const city = cvData.citta || profile?.city || '';
       const phone = cvData.telefono || profile?.phone || '';
       const email = cvData.email || profile?.email || '';
 
-      const fallbackCorpo = `Gentile Responsabile delle Risorse Umane di <b>${selectedAzienda.nome}</b>,<br><br>desidero sottoporre la mia candidatura spontanea per il vostro organico a ${selectedAzienda.citta || 'sede'}.<br><br>Opero come <b>${role}</b>${cvData.competenze && cvData.competenze.length > 0 ? ` con competenze in ${cvData.competenze.slice(0, 3).join(', ')}` : ''}. Dispongo di <b>Permesso G (Frontalieri Svizzera)</b> e disponibilità immediata.<br><br>In allegato trasmetto il mio Curriculum Vitae aggiornato per una vostra valutazione. Resto a completa disposizione per un colloquio conoscitivo.<br><br>Cordiali saluti,`;
+      const fallbackCorpo = `Gentile Responsabile delle Risorse Umane di <b>${selectedAzienda.nome}</b>,<br><br>desidero sottoporre la mia candidatura spontanea per il vostro organico a ${selectedAzienda.citta || 'sede'}.<br><br>Opero come <b>${role}</b>${cvData.competenze && cvData.competenze.length > 0 ? ` con competenze in ${cvData.competenze.slice(0, 3).join(', ')}` : ''}.<br><br>In allegato trasmetto il mio Curriculum Vitae aggiornato per una vostra valutazione. Resto a completa disposizione per un colloquio conoscitivo.<br><br>Cordiali saluti,`;
 
       const fallbackFirma = [
         fullName,
@@ -517,7 +519,7 @@ export function EmailComposer() {
         currentEmail.oggetto,
         fullBodyHtml,
         'v1',
-        user?.id || 'user_blunero90'
+        requireUid(user?.id)
       );
 
       // Track for anti-spam
@@ -1066,7 +1068,7 @@ export function EmailComposer() {
                               currentEmail.oggetto,
                               currentEmail.corpo,
                               'manual',
-                              user?.id || 'user_blunero90'
+                              requireUid(user?.id)
                             );
 
                             // Track for anti-spam

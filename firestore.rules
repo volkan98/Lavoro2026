@@ -1,51 +1,11 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-
-    function isAuthenticated() {
-      return request.auth != null;
-    }
-
-    // User Profile with isolated private subcollections
-    // Permette lettura e scrittura per sincronizzare profilo e candidature dell'utente
-    match /users/{userId} {
-      allow read, write: if true;
-      
-      // Companies subcollection
-      match /companies/{companyId} {
-        allow read, write: if true;
+    match /users/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+      match /{document=**} {
+        allow read, write: if request.auth != null && request.auth.uid == uid;
       }
-
-      // Sent emails subcollection
-      match /sent_emails/{emailId} {
-        allow read, write: if true;
-      }
-
-      // Campaigns subcollection
-      match /campaigns/{campaignId} {
-        allow read, write: if true;
-      }
-
-      // Campaign queue subcollection
-      match /campaign_queue/{queueId} {
-        allow read, write: if true;
-      }
-
-      // Tokens / OAuth subcollection
-      match /tokens/{tokenId} {
-        allow read, write: if true;
-      }
-
-      match /{allSubcollections=**} {
-        allow read, write: if true;
-      }
-    }
-
-    // Default deny for all other paths
-    match /{document=**} {
-      allow read, write: if false;
     }
   }
 }
-
-

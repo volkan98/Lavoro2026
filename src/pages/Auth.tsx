@@ -63,7 +63,7 @@ export default function Auth() {
       await signUp({
         email: regEmail,
         password: regPassword,
-        fullName: regFullName || regEmail.split('@')[0],
+        fullName: regFullName,
         city: regCity || '',
       });
       toast({
@@ -161,6 +161,7 @@ export default function Auth() {
                     <Input
                       id="login-password"
                       type="password"
+                      required
                       placeholder="••••••••"
                       value={loginPassword}
                       onChange={(e) => setLoginPassword(e.target.value)}
@@ -230,6 +231,7 @@ export default function Auth() {
                     <Input
                       id="reg-password"
                       type="password"
+                      required
                       placeholder="Crea una password"
                       value={regPassword}
                       onChange={(e) => setRegPassword(e.target.value)}

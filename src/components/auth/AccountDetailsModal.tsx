@@ -27,7 +27,7 @@ interface AccountDetailsModalProps {
 
 export function AccountDetailsModal({ open, onOpenChange }: AccountDetailsModalProps) {
   const { user, signOut } = useAuth();
-  const { profile, fetchProfile, hasSavedCV, hasSavedProfile } = useUserProfile();
+  const { profile, fetchProfile, hasSavedCV, hasSavedProfile, syncError, source } = useUserProfile();
   const { setCurrentStep, logInvii } = useCVContext();
   const { toast } = useToast();
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -38,12 +38,13 @@ export function AccountDetailsModal({ open, onOpenChange }: AccountDetailsModalP
       await fetchProfile();
       toast({
         title: 'Profilo sincronizzato',
-        description: 'Dati aggiornati da Cloud Firestore e server con successo.',
+        description: 'Recupero del profilo completato. Controlla lo stato mostrato qui sotto.',
       });
     } catch {
       toast({
-        title: 'Sincronizzazione completata',
-        description: 'I dati locali e cloud sono allineati.',
+        title: 'Sincronizzazione non riuscita',
+        description: 'I dati già caricati sono stati mantenuti.',
+        variant: 'destructive',
       });
     } finally {
       setIsRefreshing(false);
@@ -115,31 +116,10 @@ export function AccountDetailsModal({ open, onOpenChange }: AccountDetailsModalP
                 </div>
                 <div className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400 font-medium text-[11px]">
                   <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>Attivo</span>
+                  <span>{source === 'cloud' && !syncError ? 'Sincronizzato' : 'Da verificare'}</span>
                 </div>
               </div>
 
-              <div className="p-2.5 rounded-lg border border-border/60 bg-card flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Database className="w-4 h-4 text-primary" />
-                  <span className="font-medium text-foreground">Database Server (app_data.json)</span>
-                </div>
-                <div className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400 font-medium text-[11px]">
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>Sincronizzato</span>
-                </div>
-              </div>
-
-              <div className="p-2.5 rounded-lg border border-border/60 bg-card flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <HardDrive className="w-4 h-4 text-primary" />
-                  <span className="font-medium text-foreground">Archivio Locale & IndexedDB</span>
-                </div>
-                <div className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400 font-medium text-[11px]">
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>Protetto</span>
-                </div>
-              </div>
             </div>
           </div>
 
@@ -151,7 +131,7 @@ export function AccountDetailsModal({ open, onOpenChange }: AccountDetailsModalP
                 Stato Curriculum Vitae:
               </span>
               <span className="font-semibold text-foreground">
-                {hasSavedCV || hasSavedProfile ? '✅ Caricato & Salvato' : '⚠️ Non ancora caricato'}
+                {hasSavedCV ? 'Dati estratti presenti' : '⚠️ Non ancora caricato'}
               </span>
             </div>
 
@@ -173,6 +153,7 @@ export function AccountDetailsModal({ open, onOpenChange }: AccountDetailsModalP
             </div>
           </div>
 
+          {syncError && <p role="alert" className="text-sm text-destructive">{syncError}</p>}
           {/* Action buttons */}
           <div className="flex items-center gap-2 pt-1">
             <Button

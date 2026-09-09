@@ -1,3 +1,5 @@
+import { scopedStorageKey } from '@/lib/api/client';
+import { apiFetch } from '@/lib/api/client';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 
 export interface BlacklistEntry {
@@ -63,7 +65,7 @@ export function isEmailBlacklisted(
 
 export function getLocalBlacklist(): BlacklistEntry[] {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY_BLACKLIST);
+    const saved = localStorage.getItem(scopedStorageKey(STORAGE_KEY_BLACKLIST));
     if (saved) {
       const parsed = JSON.parse(saved);
       if (Array.isArray(parsed)) return parsed;
@@ -76,7 +78,7 @@ export function getLocalBlacklist(): BlacklistEntry[] {
 
 export function saveLocalBlacklist(list: BlacklistEntry[]) {
   try {
-    localStorage.setItem(STORAGE_KEY_BLACKLIST, JSON.stringify(list));
+    localStorage.setItem(scopedStorageKey(STORAGE_KEY_BLACKLIST), JSON.stringify(list));
     window.dispatchEvent(new CustomEvent(BLACKLIST_CHANGE_EVENT, { detail: list }));
   } catch (e) {
     console.warn('Error saving local blacklist:', e);
@@ -92,7 +94,7 @@ export function useBlacklist() {
   const fetchBlacklist = useCallback(async () => {
     try {
       setIsLoading(true);
-      const res = await fetch('/api/blacklist');
+      const res = await apiFetch('/api/blacklist');
       if (res.ok) {
         const json = await res.json();
         if (json.success && Array.isArray(json.data)) {
@@ -177,7 +179,7 @@ export function useBlacklist() {
 
       // Async sync to server
       try {
-        await fetch('/api/blacklist', {
+        await apiFetch('/api/blacklist', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ pattern, type, notes }),
@@ -202,7 +204,7 @@ export function useBlacklist() {
 
       // Async sync to server
       try {
-        await fetch(`/api/blacklist/${encodeURIComponent(idOrPattern)}`, {
+        await apiFetch(`/api/blacklist/${encodeURIComponent(idOrPattern)}`, {
           method: 'DELETE',
         });
       } catch (err) {

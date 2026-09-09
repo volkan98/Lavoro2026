@@ -1,3 +1,4 @@
+import { scopedStorageKey } from '@/lib/api/client';
 import { useState, useEffect } from 'react';
 import { useCVContext } from '@/contexts/CVContext';
 import { aiAgent, Company } from '@/lib/api/ai-agent';
@@ -150,7 +151,7 @@ export function CompanySearch() {
 
   // Controlla se ci sono preferenze salvate
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
+    const saved = localStorage.getItem(scopedStorageKey(STORAGE_KEY));
     setHasSavedPreferences(!!saved);
   }, []);
 
@@ -164,7 +165,7 @@ export function CompanySearch() {
       showOnlyWithEmail,
       onlySelectedCity,
     };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+    localStorage.setItem(scopedStorageKey(STORAGE_KEY), JSON.stringify(prefs));
     setHasSavedPreferences(true);
     toast({
       title: '⭐ Preferenze salvate',
@@ -173,7 +174,7 @@ export function CompanySearch() {
   };
 
   const loadPreferences = () => {
-    const saved = localStorage.getItem(STORAGE_KEY);
+    const saved = localStorage.getItem(scopedStorageKey(STORAGE_KEY));
     if (saved) {
       try {
         const prefs: SavedSearchPreferences = JSON.parse(saved);
@@ -195,7 +196,7 @@ export function CompanySearch() {
   };
 
   const clearPreferences = () => {
-    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(scopedStorageKey(STORAGE_KEY));
     setHasSavedPreferences(false);
     toast({
       title: 'Preferenze rimosse',

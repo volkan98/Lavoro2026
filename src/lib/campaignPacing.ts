@@ -1,3 +1,4 @@
+import { requireUid } from '@/lib/api/client';
 /**
  * Campaign Pacing and Anti-Spam Safety System for Auto Mode
  *
@@ -85,7 +86,7 @@ export function cleanHourlyTimestamps(timestamps: number[], now = Date.now()): n
   return timestamps.filter((t) => typeof t === 'number' && t > oneHourAgo);
 }
 
-export function loadPacingState(userId = 'user_blunero90'): PacingState {
+export function loadPacingState(userId = requireUid()): PacingState {
   const today = getTodayDateString();
   const defaultState: PacingState = {
     dailyDate: today,
@@ -137,7 +138,7 @@ export function loadPacingState(userId = 'user_blunero90'): PacingState {
   return defaultState;
 }
 
-export function savePacingState(state: PacingState, userId = 'user_blunero90'): void {
+export function savePacingState(state: PacingState, userId = requireUid()): void {
   try {
     localStorage.setItem(`${STORAGE_KEY_PREFIX}${userId}`, JSON.stringify(state));
   } catch (err) {
@@ -405,71 +406,15 @@ export function generateVariedEmail(params: {
   style?: string;
   seedIndex?: number;
 }): { subject: string; bodyText: string } {
-  const {
-    candidateName,
-    companyName,
-    companyCity = 'Ticino',
-    companySector = 'settore tecnico / produttivo',
-    skills = [],
-    seedIndex = Math.floor(Math.random() * 100),
-  } = params;
-
-  const loc = companyCity || 'Canton Ticino';
-  const roleKeywords = skills.length > 0 ? skills.slice(0, 2).join(' e ') : 'mansioni tecniche / operative';
-
-  // 1. Varied Subject Lines (rotates based on seedIndex to avoid identical inbox subjects)
-  const subjectTemplates = [
-    `Candidatura Spontanea - ${candidateName} (Disponibilità Frontaliere ${loc} / Permesso G)`,
-    `${candidateName} - Autocandidatura per opportunità lavorative presso ${companyName}`,
-    `Candidatura: disponibilità per ${companyName} (${loc}) - ${candidateName}`,
-    `All'attenzione delle Risorse Umane di ${companyName} - Candidatura ${candidateName}`,
-    `Proposta di candidatura: ${roleKeywords} - ${candidateName} (Frontaliere Ticino)`,
-    `Candidatura spontanea per il vostro organico a ${loc} - ${candidateName}`,
-  ];
-
-  const subject = subjectTemplates[seedIndex % subjectTemplates.length];
-
-  // 2. Varied Salutations
-  const salutations = [
-    `Gentile Responsabile Risorse Umane di ${companyName},`,
-    `Alla cortese attenzione del Team Risorse Umane di ${companyName},`,
-    `Gentile Direzione e Ufficio del Personale di ${companyName},`,
-    `Spettabile ${companyName}, all'attenzione del dipartimento HR,`,
-  ];
-  const salutation = salutations[seedIndex % salutations.length];
-
-  // 3. Varied Openings
-  const openings = [
-    `desidero sottoporre alla Vostra cortese attenzione la mia candidatura spontanea per eventuali opportunità lavorative aperte presso la Vostra sede di ${loc}.`,
-    `con la presente desidero manifestare il mio vivo interesse a collaborare con la Vostra azienda nel contesto delle Vostre attività a ${loc}.`,
-    `Le scrivo per proporre il mio profilo professionale per possibili inserimenti lavorativi all'interno del Vostro organico aziendale a ${loc}.`,
-    `mi permetto di trasmettere il mio profilo professionale in vista di future ricerche di personale qualificato per la Vostra struttura di ${loc}.`,
-  ];
-  const opening = openings[seedIndex % openings.length];
-
-  // 4. Swiss Permesso G readiness formulation
-  const swissStatus = [
-    `Residente in zona di confine e immediatamente disponibile, possiedo piena idoneità per l'attività lavorativa in Svizzera con rilascio del Permesso G (Frontalieri).`,
-    `Grazie alla vicinanza geografica con il Ticino, posso garantire massima puntualità, flessibilità negli orari e immediata disponibilità con Permesso G per frontalieri.`,
-    `Sono cittadino comunitario residente nella fascia frontaliera, pronto a prendere servizio tempestivamente con la necessaria procedura per il Permesso G.`,
-  ];
-  const swissPart = swissStatus[seedIndex % swissStatus.length];
-
-  // 5. Varied closings
-  const closings = [
-    `Allego alla presente il mio Curriculum Vitae dettagliato in formato PDF e resto a completa disposizione per un colloquio conoscitivo, anche con breve preavviso.`,
-    `In allegato troverete il mio Curriculum Vitae aggiornato (PDF). RingraziandoVi per l'attenzione riservatami, rimango a Vostra disposizione per qualsiasi approfondimento.`,
-    `Trasmetto in allegato il mio CV in PDF per una Vostra valutazione e sarei lieto di poter illustrare di persona le mie esperienze in un colloquio conoscitivo.`,
-  ];
-  const closing = closings[seedIndex % closings.length];
-
-  const bodyText = `${salutation}\n\n` +
-    `${opening}\n\n` +
-    `Ho maturato esperienza pratica nel settore (${companySector}), sviluppando precisione, affidabilità e capacità di lavorare sia in autonomia che in squadra.\n\n` +
-    `${swissPart}\n\n` +
-    `${closing}\n\n` +
-    `Cordiali saluti,\n` +
-    `${candidateName}`;
-
-  return { subject, bodyText };
+  const { candidateName, companyName, skills = [] } = params;
+  return {
+    subject: `Candidatura spontanea${candidateName ? ` – ${candidateName}` : ''}`,
+    bodyText: [
+      `Gentile Responsabile delle Risorse Umane di ${companyName},`,
+      'desidero proporre la mia candidatura per eventuali opportunità lavorative.',
+      skills.length ? `Le mie competenze comprendono: ${skills.join(', ')}.` : '',
+      'Trasmetto in allegato il mio Curriculum Vitae e resto a disposizione per un colloquio conoscitivo.',
+      'Cordiali saluti,', candidateName,
+    ].filter(Boolean).join('\n\n'),
+  };
 }

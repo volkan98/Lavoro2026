@@ -1,36 +1,11 @@
+import { apiFetch } from '@/lib/api/client';
 import { db } from '@/lib/firebase';
 import { collection, doc, setDoc, getDocs, deleteDoc } from 'firebase/firestore';
 
-export interface CVData {
-  nome: string;
-  cognome: string;
-  email: string;
-  telefono: string;
-  citta: string;
-  cap: string;
-  profilo: string;
-  competenze: string[];
-  esperienze: Array<{
-    ruolo: string;
-    azienda: string;
-    dataInizio: string;
-    dataFine: string;
-    descrizione: string;
-  }>;
-  istruzione: Array<{
-    titolo: string;
-    istituto: string;
-    anno: string;
-  }>;
-  lingue: Array<{
-    lingua: string;
-    livello: string;
-  }>;
-  permessoG?: boolean | string;
-  statoPermesso?: string;
-  sintesiBreve: string;
-  sintesiCompleta: string;
-}
+import type { CVData } from '@/types/cv';
+export type { CVData } from '@/types/cv';
+import { normalizeCvData, hasCvData } from '@/lib/cvNormalizer';
+import { requireUid, userCacheKey } from '@/lib/api/client';
 
 export interface Company {
   id?: string;
@@ -71,61 +46,18 @@ export const aiAgent = {
   async parseCV(
     cvInput: string | { cvText?: string; base64Data?: string; mimeType?: string; fileName?: string }
   ): Promise<{ success: boolean; data?: CVData; error?: string }> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 180000);
     try {
       const payload = typeof cvInput === 'string' ? { cvText: cvInput } : cvInput;
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 25000); // 25s timeout for multimodal AI
-
-      const res = await fetch('/api/ai/parse-cv', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-
-      let json: any = {};
-      try {
-        json = await res.json();
-      } catch (e) {
-        json = { success: false, error: `Errore server (${res.status}): risposta non valida` };
-      }
-
-      if (res.ok && json.success && json.data) {
-        return { success: true, data: json.data };
-      }
+      const res = await apiFetch('/api/ai/parse-cv', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload), signal: controller.signal });
+      const json = await res.json();
+      if (!res.ok || !json.success || !hasCvData(json.data)) throw new Error(json.error || 'Analisi del CV non riuscita');
+      return { success: true, data: normalizeCvData(json.data) };
     } catch (error: any) {
-      console.warn('Network parse-cv error/timeout, activating fast local fallback:', error?.message);
-    }
-
-    // Fast local heuristic extraction fallback if server times out
-    try {
-      const rawText = typeof cvInput === 'string' ? cvInput : (cvInput.cvText || '');
-      const emailMatch = rawText.match(/[\w.-]+@[\w.-]+\.\w{2,}/);
-      const phoneMatch = rawText.match(/(\+?\d{1,4}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{3,}[-.\s]?\d{3,})/);
-      
-      const fallbackData: CVData = {
-        nome: '',
-        cognome: '',
-        email: emailMatch ? emailMatch[0] : '',
-        telefono: phoneMatch ? phoneMatch[0] : '',
-        citta: '',
-        cap: '',
-        profilo: '',
-        permessoG: 'Idoneo',
-        statoPermesso: 'Idoneo al rilascio immediato di Permesso G (Cittadino UE / Frontalieri Svizzera)',
-        competenze: [],
-        esperienze: [],
-        istruzione: [],
-        lingue: [],
-        sintesiBreve: '',
-        sintesiCompleta: '',
-      };
-
-      return { success: true, data: fallbackData };
-    } catch (fallbackErr: any) {
-      return { success: false, error: fallbackErr?.message || 'Errore durante l\'analisi del CV' };
-    }
+      return { success: false, error: error.name === 'AbortError' ? 'Analisi scaduta. Riprova: il profilo precedente è stato mantenuto.' : error.message };
+    } finally { clearTimeout(timer); }
   },
 
   // Search companies using Google Gemini AI & Swiss/Italian Knowledge
@@ -143,7 +75,7 @@ export const aiAgent = {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 25000); // 25s max timeout
 
-      const res = await fetch('/api/ai/search-companies', {
+      const res = await apiFetch('/api/ai/search-companies', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
@@ -411,13 +343,13 @@ export const aiAgent = {
     cvData: Partial<CVData>,
     variant: 'breve' | 'standard' | 'formale' = 'standard',
     targetRole?: string,
-    availability: string = 'immediata'
+    availability: string = ''
   ): Promise<{ success: boolean; data?: EmailTemplate; error?: string }> {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
 
-      const res = await fetch('/api/ai/generate-email', {
+      const res = await apiFetch('/api/ai/generate-email', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ company, cvData, variant, targetRole, availability }),
@@ -436,9 +368,9 @@ export const aiAgent = {
     }
 
     // Grounded, natural, concise fallback (100-160 words) using ONLY real candidate info
-    const fullName = `${cvData.nome || ''} ${cvData.cognome || ''}`.trim() || 'Candidato';
+    const fullName = `${cvData.nome || ''} ${cvData.cognome || ''}`.trim() || '';
     const compName = company.name || 'Spettabile Azienda';
-    const role = (targetRole || (cvData as any)?.targetRole || cvData.esperienze?.[0]?.ruolo || (Array.isArray(cvData.competenze) && cvData.competenze[0]) || '').trim() || 'Professionista';
+    const role = (targetRole || (cvData as any)?.targetRole || cvData.esperienze?.[0]?.ruolo || (Array.isArray(cvData.competenze) && cvData.competenze[0]) || '').trim() || '';
     const skillsArray = Array.isArray(cvData.competenze) ? cvData.competenze.filter(Boolean) : [];
     const skillsSnippet = skillsArray.length > 0 
       ? `Nel corso del mio percorso professionale ho acquisito competenze operative in <b>${skillsArray.slice(0, 3).join(', ')}</b>.`
@@ -447,7 +379,7 @@ export const aiAgent = {
 
     const firstExp = Array.isArray(cvData.esperienze) && cvData.esperienze.length > 0 ? cvData.esperienze[0] : null;
     const expSnippet = firstExp && firstExp.ruolo
-      ? `Ho maturato esperienza lavorativa come ${firstExp.ruolo}${firstExp.azienda ? ` presso ${firstExp.azienda}` : ''}, garantendo puntualità, precisione e serietà.`
+      ? `Ho maturato esperienza lavorativa come ${firstExp.ruolo}${firstExp.azienda ? ` presso ${firstExp.azienda}` : ''}.`
       : '';
 
     const locPart = userCity ? `Residente a ${userCity}, ` : '';
@@ -481,7 +413,7 @@ export const aiAgent = {
       firma: firmaLines.join('\n').trim(),
       matchPoints: [
         `Ruolo: ${role}`,
-        skillsArray[0] ? `Competenza: ${skillsArray[0]}` : 'Profilo qualificato',
+        skillsArray[0] ? `Competenza: ${skillsArray[0]}` : '',
         userCity ? `Località: ${userCity}` : 'Disponibilità per colloquio',
       ],
     };
@@ -500,8 +432,9 @@ export const aiAgent = {
     lastSentDate?: string;
     originalCompany?: string;
   }> {
+    const userId = requireUid();
     try {
-      const res = await fetch('/api/check-duplicate', {
+      const res = await apiFetch('/api/check-duplicate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, company_name: companyName, check_domain: checkDomain }),
@@ -510,7 +443,7 @@ export const aiAgent = {
       return json;
     } catch (error) {
       try {
-        const localSent = JSON.parse(localStorage.getItem('sent_emails_history') || '[]');
+        const localSent = JSON.parse(localStorage.getItem(`sent_emails_history_${userId}`) || '[]');
         const normEmail = (email || '').toLowerCase();
         const normName = (companyName || '').toLowerCase();
         const found = localSent.find((s: any) => 
@@ -540,9 +473,10 @@ export const aiAgent = {
     subject: string,
     body?: string,
     cvVersion?: string,
-    userId: string = 'user_blunero90'
+    userId: string = requireUid()
   ): Promise<{ success: boolean; error?: string }> {
     try {
+      requireUid(userId);
       const emailId = `sent_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
       const cleanName = companyName || '';
       const cleanEmail = (email || '').toLowerCase().trim();
@@ -562,16 +496,14 @@ export const aiAgent = {
 
       // 1. Firebase Firestore sync
       try {
-        const emailDocRef = doc(db, 'users', userId, 'sent_emails', emailId);
-        setDoc(emailDocRef, newRecord).catch((err) => {
-          console.warn('[Firebase] Firestore recordSentEmail async save warning:', err);
-        });
+        const emailDocRef = doc(db, 'users', userId, 'sentEmails', emailId);
+        await setDoc(emailDocRef, newRecord);
       } catch (fbErr) {
-        console.warn('[Firebase] Firestore recordSentEmail save warning:', fbErr);
+        throw fbErr;
       }
 
       // 2. Server save
-      fetch('/api/sent-emails', {
+      apiFetch('/api/sent-emails', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newRecord),
@@ -588,7 +520,7 @@ export const aiAgent = {
         } catch {}
       };
       saveToLocalKey(`sent_emails_history_${userId}`);
-      saveToLocalKey('sent_emails_history');
+
 
       return { success: true };
     } catch (error: any) {
@@ -598,12 +530,13 @@ export const aiAgent = {
   },
 
   // Get sent emails history from Firebase Firestore, server and local storage
-  async getSentEmails(userId: string = 'user_blunero90'): Promise<any[]> {
+  async getSentEmails(userId: string = requireUid()): Promise<any[]> {
+    requireUid(userId);
     const combinedMap = new Map<string, any>();
 
     // 1. Try Firebase Firestore
     try {
-      const sentColRef = collection(db, 'users', userId, 'sent_emails');
+      const sentColRef = collection(db, 'users', userId, 'sentEmails');
       const docsPromise = getDocs(sentColRef).catch(() => null);
       const timeoutPromise = new Promise<null>((res) => setTimeout(() => res(null), 1800));
       const snap = await Promise.race([docsPromise, timeoutPromise]);
@@ -618,9 +551,24 @@ export const aiAgent = {
       console.warn('[Firebase] Error fetching sent emails from Firestore:', fbErr);
     }
 
+    // Migrate old same-UID Firestore history without claiming any global/browser history.
+    try {
+      const legacy = await getDocs(collection(db, 'users', userId, 'sent_emails'));
+      for (const entry of legacy.docs) {
+        const row = entry.data();
+        if (row.user_id && row.user_id !== userId) continue;
+        const id = row.id || entry.id;
+        if (!combinedMap.has(id)) {
+          const owned = { ...row, id, user_id: userId };
+          await setDoc(doc(db, 'users', userId, 'sentEmails', id), owned);
+          combinedMap.set(id, owned);
+        }
+      }
+    } catch { /* Current history remains readable if legacy migration is unavailable. */ }
+
     // 2. Try Server
     try {
-      const res = await fetch(`/api/sent-emails?userId=${encodeURIComponent(userId)}`);
+      const res = await apiFetch(`/api/sent-emails?userId=${encodeURIComponent(userId)}`);
       if (res.ok) {
         const json = await res.json();
         if (Array.isArray(json?.data)) {
@@ -654,55 +602,28 @@ export const aiAgent = {
       } catch {}
     };
     checkLocal(`sent_emails_history_${userId}`);
-    checkLocal('sent_emails_history');
 
-    // Also check context log invii
-    try {
-      const logsRaw = localStorage.getItem('job_agent_log_invii');
-      if (logsRaw) {
-        const parsedLogs = JSON.parse(logsRaw);
-        if (Array.isArray(parsedLogs)) {
-          parsedLogs.forEach((l: any) => {
-            const destEmail = l.emailDestinatario || l.email;
-            if (destEmail) {
-              const syntheticId = `log_${destEmail}_${l.data || l.dataInvio || ''}`;
-              if (!combinedMap.has(syntheticId)) {
-                combinedMap.set(syntheticId, {
-                  id: l.id || syntheticId,
-                  user_id: userId,
-                  company_name: l.destinatario || l.nomeAzienda || 'Azienda',
-                  email: destEmail,
-                  subject: l.oggetto || 'Candidatura spontanea',
-                  status: 'sent',
-                  sent_at: l.data ? new Date(l.data).toISOString() : new Date().toISOString(),
-                });
-              }
-            }
-          });
-        }
-      }
-    } catch {}
 
     const allRecords = Array.from(combinedMap.values());
     return allRecords.sort((a: any, b: any) => (b.sent_at || '').localeCompare(a.sent_at || ''));
   },
 
   // Delete sent email record from Firestore, Server and local storage
-  async deleteSentEmail(id: string, userId: string = 'user_blunero90'): Promise<{ success: boolean; error?: string }> {
+  async deleteSentEmail(id: string, userId: string = requireUid()): Promise<{ success: boolean; error?: string }> {
     try {
       // 1. Firebase Firestore delete
       try {
-        const emailDocRef = doc(db, 'users', userId, 'sent_emails', id);
-        deleteDoc(emailDocRef).catch(() => {});
+        const emailDocRef = doc(db, 'users', userId, 'sentEmails', id);
+        await deleteDoc(emailDocRef);
       } catch (fbErr) {
         console.warn('[Firebase] Firestore delete warning:', fbErr);
       }
       // 2. Server delete
-      await fetch(`/api/sent-emails/${id}`, { method: 'DELETE' }).catch(() => {});
+      await apiFetch(`/api/sent-emails/${id}`, { method: 'DELETE' }).catch(() => {});
       // 3. LocalStorage
       let local: any[] = [];
       try {
-        const raw = localStorage.getItem('sent_emails_history');
+        const raw = localStorage.getItem(`sent_emails_history_${userId}`);
         const parsed = raw ? JSON.parse(raw) : [];
         if (Array.isArray(parsed)) local = parsed;
       } catch {
@@ -710,7 +631,7 @@ export const aiAgent = {
       }
       const updated = local.filter((item: any) => item?.id !== id);
       try {
-        localStorage.setItem('sent_emails_history', JSON.stringify(updated));
+        localStorage.setItem(`sent_emails_history_${userId}`, JSON.stringify(updated));
       } catch {
         // ignore
       }
@@ -721,7 +642,8 @@ export const aiAgent = {
   },
 
   // Save company to Firebase Firestore
-  async saveCompany(company: Company, userId: string = 'user_blunero90'): Promise<{ success: boolean; id?: string; error?: string }> {
+  async saveCompany(company: Company, userId: string = requireUid()): Promise<{ success: boolean; id?: string; error?: string }> {
+    requireUid(userId);
     const id = company.id || `comp_${Date.now()}`;
     const newComp = { ...company, id, userId, created_at: new Date().toISOString() };
 
@@ -735,7 +657,7 @@ export const aiAgent = {
 
     // 2. Server API
     try {
-      fetch('/api/companies', {
+      apiFetch('/api/companies', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newComp),
@@ -748,7 +670,8 @@ export const aiAgent = {
   },
 
   // Get saved companies from Firestore
-  async getSavedCompanies(userId: string = 'user_blunero90'): Promise<Company[]> {
+  async getSavedCompanies(userId: string = requireUid()): Promise<Company[]> {
+    requireUid(userId);
     // 1. Try Firebase Firestore
     try {
       const compColRef = collection(db, 'users', userId, 'companies');
@@ -764,7 +687,7 @@ export const aiAgent = {
 
     // 2. Server API fallback
     try {
-      const res = await fetch('/api/companies');
+      const res = await apiFetch('/api/companies');
       if (res.ok) {
         const json = await res.json();
         return json.data || [];

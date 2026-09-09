@@ -1,3 +1,4 @@
+import { scopedStorageKey } from '@/lib/api/client';
 import { useState, useEffect, useRef } from 'react';
 import { ManualCompanySearch } from './ManualCompanySearch';
 import { useCVContext } from '@/contexts/CVContext';
@@ -917,7 +918,7 @@ function QueueStatusBadge({ status }: { status: string }) {
 
 export function AutoCampaignDashboard() {
   const { cvData, cvFileState, sintesiBreve, setCurrentStep } = useCVContext();
-  const { profile } = useUserProfile();
+  const { profile, hasSavedCV } = useUserProfile();
   const autoCampaign = useAutoCampaign();
   const { campaign, isLoading, startCampaign } = autoCampaign;
 
@@ -930,17 +931,7 @@ export function AutoCampaignDashboard() {
     );
   }
 
-  const hasCv = Boolean(
-    profile?.cv_file_path ||
-    profile?.cv_short_summary ||
-    sintesiBreve ||
-    cvData?.nome ||
-    cvData?.profilo ||
-    (cvData?.competenze && cvData.competenze.length > 0) ||
-    cvFileState?.fileName ||
-    localStorage.getItem('job_agent_cv_data') ||
-    localStorage.getItem('ais_job_outreach_profile')
-  );
+  const hasCv = hasSavedCV && Boolean(cvFileState?.base64Data);
 
   if (!hasCv) {
     return (

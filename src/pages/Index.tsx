@@ -7,7 +7,11 @@ import { EmailComposer } from '@/components/email/EmailComposer';
 import { SentEmailsHistory } from '@/components/email/SentEmailsHistory';
 import { AutoCampaignDashboard } from '@/components/auto/AutoCampaignDashboard';
 
+import { useAuth } from '@/hooks/useAuth';
+import { Navigate } from 'react-router-dom';
+
 export default function Index() {
+  const { user, loading } = useAuth();
   const { currentStep } = useCVContext();
 
   const renderStepContent = () => {
@@ -29,5 +33,7 @@ export default function Index() {
     }
   };
 
+  if (loading) return <p className="p-8">Accesso in corso…</p>;
+  if (!user) return <Navigate to="/auth" replace />;
   return <AppLayout>{renderStepContent()}</AppLayout>;
 }

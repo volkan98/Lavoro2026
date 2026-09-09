@@ -1,262 +1,83 @@
-import {
-  GoogleAuthProvider,
-  signInWithPopup,
-  onAuthStateChanged,
-  signOut,
-  User,
-} from 'firebase/auth';
+import { onAuthStateChanged, type User } from 'firebase/auth';
 import { auth } from './firebase';
+import { requireUid } from './api/client';
+import { verifyOriginalAttachment } from './cvStorage';
 import firebaseConfigJson from '../../firebase-applet-config.json';
 
-// Workspace Scopes configured via set_up_oauth
-export const SCOPES = ['https://www.googleapis.com/auth/gmail.send'];
-
-const SESSION_TOKEN_KEY = 'ais_workspace_gmail_token';
-const SESSION_EMAIL_KEY = 'ais_workspace_gmail_email';
-const SESSION_EXPIRY_KEY = 'ais_workspace_gmail_expiry';
-
-// In-memory token cache backed by sessionStorage for active browser sessions
-let cachedAccessToken: string | null = null;
-let cachedUserEmail: string | null = null;
-let isSigningIn = false;
-
-// Initialize Google Auth Provider with Gmail scopes
-function createGoogleProvider(): GoogleAuthProvider {
-  const provider = new GoogleAuthProvider();
-  for (const scope of SCOPES) {
-    provider.addScope(scope);
-  }
-  provider.setCustomParameters({
-    prompt: 'consent select_account',
-    access_type: 'offline',
-  });
-  return provider;
-}
-
-export function getCachedGmailToken(): string | null {
-  if (cachedAccessToken) return cachedAccessToken;
+export const SCOPES = ['openid', 'email', 'https://www.googleapis.com/auth/gmail.send'];
+type GmailGrant = { uid: string; email: string; token: string; expiresAt: number };
+const key = (uid: string) => `ais_workspace_gmail_${uid}`;
+let activeUid: string | null = null;
+const changed = () => window.dispatchEvent(new Event('gmail-authorization-changed'));
+function grant(): GmailGrant | null {
+  const uid = auth.currentUser?.uid;
+  if (!uid) return null;
   try {
-    const saved = sessionStorage.getItem(SESSION_TOKEN_KEY);
-    const expiry = sessionStorage.getItem(SESSION_EXPIRY_KEY);
-    if (saved) {
-      if (!expiry || Date.now() < parseInt(expiry, 10)) {
-        cachedAccessToken = saved;
-        const savedEmail = sessionStorage.getItem(SESSION_EMAIL_KEY);
-        if (savedEmail) cachedUserEmail = savedEmail;
-        return saved;
-      } else {
-        // Expired
-        sessionStorage.removeItem(SESSION_TOKEN_KEY);
-        sessionStorage.removeItem(SESSION_EXPIRY_KEY);
-      }
-    }
-  } catch {}
+    const data = JSON.parse(sessionStorage.getItem(key(uid)) || 'null');
+    if (data?.uid === uid && data.token && data.email && data.expiresAt > Date.now()) return data;
+  } catch { /* Invalid cache is never a grant. */ }
   return null;
 }
-
-export function setCachedGmailToken(token: string | null, email?: string | null, expiresInSeconds = 3500) {
-  cachedAccessToken = token;
-  if (email) cachedUserEmail = email;
-  try {
-    if (token) {
-      sessionStorage.setItem(SESSION_TOKEN_KEY, token);
-      sessionStorage.setItem(SESSION_EXPIRY_KEY, String(Date.now() + expiresInSeconds * 1000));
-      if (email) sessionStorage.setItem(SESSION_EMAIL_KEY, email);
-    } else {
-      sessionStorage.removeItem(SESSION_TOKEN_KEY);
-      sessionStorage.removeItem(SESSION_EXPIRY_KEY);
-      sessionStorage.removeItem(SESSION_EMAIL_KEY);
-    }
-  } catch {}
-}
-
-export function getCachedGmailEmail(): string | null {
-  if (cachedUserEmail) return cachedUserEmail;
-  try {
-    const savedEmail = sessionStorage.getItem(SESSION_EMAIL_KEY);
-    if (savedEmail) {
-      cachedUserEmail = savedEmail;
-      return savedEmail;
-    }
-  } catch {}
-  return null;
-}
-
+export const getCachedGmailToken = () => grant()?.token || null;
+export const getCachedGmailEmail = () => grant()?.email || null;
 export function clearGmailToken() {
-  cachedAccessToken = null;
-  cachedUserEmail = null;
   try {
-    sessionStorage.removeItem(SESSION_TOKEN_KEY);
-    sessionStorage.removeItem(SESSION_EXPIRY_KEY);
-    sessionStorage.removeItem(SESSION_EMAIL_KEY);
-  } catch {}
+    for (const uid of [activeUid, auth.currentUser?.uid]) if (uid) sessionStorage.removeItem(key(uid));
+    for (const old of ['ais_workspace_gmail_token', 'ais_workspace_gmail_email', 'ais_workspace_gmail_expiry']) sessionStorage.removeItem(old);
+  } catch { /* Cache access must not prevent Firebase logout. */ }
+  activeUid = null;
+  changed();
 }
-
-// Ensure Google Identity Services script is available
-function ensureGisLoaded(): Promise<boolean> {
-  return new Promise((resolve) => {
-    const w = window as any;
-    if (w.google?.accounts?.oauth2) {
-      return resolve(true);
-    }
-    let script = document.querySelector('script[src*="accounts.google.com/gsi/client"]') as HTMLScriptElement | null;
-    if (!script) {
-      script = document.createElement('script');
-      script.src = 'https://accounts.google.com/gsi/client';
-      script.async = true;
-      script.defer = true;
-      document.body.appendChild(script);
-    }
-    const timer = setInterval(() => {
-      if (w.google?.accounts?.oauth2) {
-        clearInterval(timer);
-        resolve(true);
-      }
-    }, 100);
-    setTimeout(() => {
-      clearInterval(timer);
-      resolve(!!w.google?.accounts?.oauth2);
-    }, 3000);
+export function initWorkspaceAuth(onSuccess?: (user: User, token: string) => void, onFailure?: () => void) {
+  return onAuthStateChanged(auth, user => {
+    if (activeUid && activeUid !== user?.uid) clearGmailToken();
+    activeUid = user?.uid || null;
+    const token = getCachedGmailToken();
+    if (user && token) onSuccess?.(user, token); else onFailure?.();
   });
 }
-
-// Request token via Google Identity Services Token Client
-function requestGisToken(): Promise<string> {
-  return new Promise(async (resolve, reject) => {
+async function ensureGisLoaded() {
+  if ((window as any).google?.accounts?.oauth2) return;
+  await new Promise<void>((resolve, reject) => {
+    let script = document.querySelector('script[src="https://accounts.google.com/gsi/client"]') as HTMLScriptElement;
+    if (!script) { script = document.createElement('script'); script.src = 'https://accounts.google.com/gsi/client'; script.async = true; document.head.appendChild(script); }
+    const timer = setTimeout(() => reject(new Error('Servizio di autorizzazione Google non disponibile')), 10000);
+    script.addEventListener('load', () => { clearTimeout(timer); resolve(); }, { once: true });
+    script.addEventListener('error', () => { clearTimeout(timer); reject(new Error('Caricamento Google non riuscito')); }, { once: true });
+  });
+}
+export async function connectGmailAccount(_forceConsent = false): Promise<{ success: boolean; email?: string; accessToken?: string; error?: string }> {
+  try {
+    const uid = requireUid();
+    const firebaseUser = auth.currentUser!;
+    await ensureGisLoaded();
     const clientId = (firebaseConfigJson as any).oAuthClientId;
-    if (!clientId) {
-      return reject(new Error('OAuth Client ID non configurato in firebase-applet-config.json'));
-    }
-
-    const w = window as any;
-    if (!w.google?.accounts?.oauth2) {
-      const loaded = await ensureGisLoaded();
-      if (!loaded || !w.google?.accounts?.oauth2) {
-        return reject(new Error('Servizio Google Identity non disponibile'));
-      }
-    }
-
-    try {
-      const client = w.google.accounts.oauth2.initTokenClient({
-        client_id: clientId,
-        scope: SCOPES.join(' '),
-        callback: (resp: any) => {
-          if (resp && resp.access_token) {
-            setCachedGmailToken(resp.access_token, undefined, resp.expires_in ? parseInt(resp.expires_in, 10) : 3500);
-            resolve(resp.access_token);
-          } else if (resp && resp.error) {
-            const errDesc = resp.error_description || resp.error;
-            reject(new Error(errDesc));
-          } else {
-            reject(new Error('Nessun token di accesso ricevuto da Google'));
-          }
-        },
-        error_callback: (err: any) => {
-          console.warn('[WorkspaceAuth] GIS error callback:', err);
-          if (err?.type === 'popup_failed_to_open' || String(err?.message || '').includes('popup')) {
-            reject(new Error('Popup bloccato dal browser. Consenti i popup per questa pagina o apri l\'app in una nuova scheda.'));
-          } else {
-            reject(new Error(err?.message || 'Errore nella finestra di autorizzazione Google'));
-          }
-        },
+    if (!clientId) throw new Error('OAuth Client ID Gmail non configurato');
+    const response: any = await new Promise((resolve, reject) => {
+      const client = (window as any).google.accounts.oauth2.initTokenClient({
+        client_id: clientId, scope: SCOPES.join(' '),
+        callback: (result: any) => result.access_token ? resolve(result) : reject(new Error(result.error_description || result.error || 'Autorizzazione non concessa')),
+        error_callback: () => reject(new Error('Autorizzazione Gmail annullata o popup bloccato. Apri l’app in una nuova scheda e riprova.')),
       });
-
-      // Synchronously launch popup request
-      client.requestAccessToken({ prompt: 'consent' });
-    } catch (err: any) {
-      reject(err);
-    }
-  });
+      client.requestAccessToken({ prompt: 'consent', login_hint: firebaseUser.email || undefined });
+    });
+    requireUid(uid);
+    if (!(response.scope || '').split(' ').includes('https://www.googleapis.com/auth/gmail.send')) throw new Error('Permesso di invio Gmail non concesso');
+    const result = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: `Bearer ${response.access_token}` } });
+    if (!result.ok) throw new Error('Impossibile verificare l’account Gmail autorizzato');
+    const info = await result.json();
+    requireUid(uid);
+    const googleIdentity = firebaseUser.providerData.find(p => p.providerId === 'google.com');
+    const sameAccount = googleIdentity ? info.sub === googleIdentity.uid
+      : firebaseUser.emailVerified && info.email_verified && info.email?.toLowerCase() === firebaseUser.email?.toLowerCase();
+    if (!sameAccount || !info.email) throw new Error('L’account Gmail deve corrispondere all’utente Firebase che ha effettuato l’accesso.');
+    const data: GmailGrant = { uid, email: info.email, token: response.access_token,
+      expiresAt: Date.now() + Math.max(0, Number(response.expires_in || 0) - 60) * 1000 };
+    sessionStorage.setItem(key(uid), JSON.stringify(data)); activeUid = uid; changed();
+    return { success: true, email: data.email, accessToken: data.token };
+  } catch (error: any) { return { success: false, error: error.message }; }
 }
-
-// Listen to auth state to clear token on logout
-export function initWorkspaceAuth(
-  onSuccess?: (user: User, token: string) => void,
-  onFailure?: () => void
-) {
-  return onAuthStateChanged(auth, async (user) => {
-    if (user) {
-      cachedUserEmail = user.email || null;
-      if (cachedAccessToken) {
-        if (onSuccess) onSuccess(user, cachedAccessToken);
-      } else if (!isSigningIn) {
-        if (onFailure) onFailure();
-      }
-    } else {
-      cachedAccessToken = null;
-      cachedUserEmail = null;
-      if (onFailure) onFailure();
-    }
-  });
-}
-
-// Authenticate user and obtain Gmail Send OAuth token
-export async function connectGmailAccount(forceConsent = false): Promise<{
-  success: boolean;
-  email?: string;
-  accessToken?: string;
-  error?: string;
-}> {
-  isSigningIn = true;
-  try {
-    // 1. First try Google Identity Services Token Client (dedicated for Workspace scopes & interactive popup)
-    try {
-      const gisToken = await requestGisToken();
-      if (gisToken) {
-        cachedAccessToken = gisToken;
-        const userEmail = cachedUserEmail || auth.currentUser?.email || 'blunero90@gmail.com';
-        return {
-          success: true,
-          email: userEmail,
-          accessToken: gisToken,
-        };
-      }
-    } catch (gisErr: any) {
-      console.warn('[WorkspaceAuth] GIS error, falling back to Firebase popup:', gisErr?.message);
-    }
-
-    // 2. Fallback: Firebase Auth with GoogleAuthProvider
-    const provider = createGoogleProvider();
-    if (forceConsent) {
-      provider.setCustomParameters({
-        prompt: 'consent select_account',
-        access_type: 'offline',
-      });
-    }
-
-    const result = await signInWithPopup(auth, provider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-
-    if (credential?.accessToken) {
-      cachedAccessToken = credential.accessToken;
-      cachedUserEmail = result.user.email || null;
-      return {
-        success: true,
-        email: result.user.email || 'utente@gmail.com',
-        accessToken: cachedAccessToken,
-      };
-    }
-
-    if (result.user.email) {
-      cachedUserEmail = result.user.email;
-    }
-
-    throw new Error('Permesso Gmail non rilasciato dal popup');
-  } catch (error: any) {
-    return {
-      success: false,
-      error: error?.message || 'Errore di autenticazione con Google',
-    };
-  } finally {
-    isSigningIn = false;
-  }
-}
-
-export async function disconnectGmailAccount() {
-  cachedAccessToken = null;
-  cachedUserEmail = null;
-  await signOut(auth).catch(() => {});
-}
+export async function disconnectGmailAccount() { clearGmailToken(); }
 
 export interface SendEmailPayload {
   to: string;
@@ -379,6 +200,9 @@ export async function sendViaGmailApi(
   error?: string;
   needsInteractiveAuth?: boolean;
 }> {
+  const checked = await verifyOriginalAttachment(payload.attachment);
+  if (!checked.ok) return { success: false, error: checked.error };
+  const sendingUid = requireUid();
   let token = getCachedGmailToken();
 
   // If token is missing, attempt interactive connect ONLY if requested
@@ -387,7 +211,7 @@ export async function sendViaGmailApi(
       // In non-interactive automode: do NOT attempt popup authorization because browser blocks popups without user gesture
       return {
         success: false,
-        error: 'Token Gmail non presente in sessione; invio tramite canale proxy.',
+        error: 'Autorizzazione Gmail assente o scaduta. Ricollega Gmail per riprendere.',
         needsInteractiveAuth: true,
       };
     }
@@ -403,6 +227,7 @@ export async function sendViaGmailApi(
     token = connectRes.accessToken;
   }
 
+  requireUid(sendingUid);
   const rawMessage = buildRfc2822Mime(payload);
 
   try {
@@ -434,6 +259,7 @@ export async function sendViaGmailApi(
       // Automatically try to request fresh consent once in interactive mode
       const retryAuth = await connectGmailAccount(true);
       if (retryAuth.success && retryAuth.accessToken) {
+        requireUid(sendingUid);
         const retryRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
           method: 'POST',
           headers: {
