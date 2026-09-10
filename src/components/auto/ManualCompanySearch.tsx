@@ -1,6 +1,4 @@
-import { scopedStorageKey } from '@/lib/api/client';
-import { requireUid } from '@/lib/api/client';
-import { apiFetch } from '@/lib/api/client';
+import { scopedStorageKey, requireUid, apiFetch, sanitizeForFirestore } from '@/lib/api/client';
 import { useState } from 'react';
 import { useAuth } from '@/hooks/useAuth';
 import { useToast } from '@/hooks/use-toast';
@@ -11,6 +9,7 @@ import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Search, Plus, Loader2, Building2, MapPin, Mail, CheckCircle2 } from 'lucide-react';
 import { aiAgent, Company } from '@/lib/api/ai-agent';
+import { isCompanyAlreadySentFirestore } from '@/lib/companyDeduplication';
 import { db } from '@/lib/firebase';
 import { doc, setDoc } from 'firebase/firestore';
 
@@ -87,13 +86,20 @@ export function ManualCompanySearch({ campaignId }: ManualCompanySearchProps) {
   const addToQueue = async (company: ManualSearchResult) => {
     if (!company.email) return;
 
-    // Check duplicate in sent emails
-    const dupCheck = await aiAgent.checkDuplicate(company.email, company.name, true);
+    // Check duplicate in Firestore "Già Inviato" (Source of Truth)
+    const dupCheck = await isCompanyAlreadySentFirestore(
+      {
+        email: company.email,
+        name: company.name,
+        website: company.website,
+      },
+      userId
+    );
 
-    if (dupCheck.isDuplicate) {
+    if (dupCheck.isAlreadySent) {
       toast({
         title: 'Già contattata',
-        description: `Email già inviata in precedenza a ${dupCheck.originalCompany || company.name}.`,
+        description: `Azienda già contattata nello storico Firestore (${dupCheck.detail || company.name}).`,
       });
       return;
     }
@@ -119,8 +125,11 @@ export function ManualCompanySearch({ campaignId }: ManualCompanySearchProps) {
 
     // Save to Firestore
     try {
-      const qDocRef = doc(db, 'users', userId, 'campaign_queue', queueItemId);
-      setDoc(qDocRef, queueRecord).catch(() => {});
+      const cleanRecord = sanitizeForFirestore(queueRecord);
+      const qDocRef1 = doc(db, 'users', userId, 'campaigns', 'current', 'queue', queueItemId);
+      const qDocRef2 = doc(db, 'users', userId, 'campaign_queue', queueItemId);
+      setDoc(qDocRef1, cleanRecord, { merge: true }).catch(() => {});
+      setDoc(qDocRef2, cleanRecord, { merge: true }).catch(() => {});
     } catch (e) {
       console.warn('Firestore queue save:', e);
     }

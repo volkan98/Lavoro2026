@@ -4,6 +4,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { useUserProfile } from '@/hooks/useUserProfile';
 import { userCacheKey } from '@/lib/api/client';
 import { getEmptyCvData } from '@/lib/cvNormalizer';
+import { loadCvBinary } from '@/lib/cvStorage';
 
 interface CVFileState { file: File | null; uid?: string; fileName?: string; base64Data?: string; mimeType?: string; contentHash?: string }
 const CVContext = createContext<ReturnType<typeof useCVState> | undefined>(undefined);
@@ -20,9 +21,22 @@ function useCVState() {
   const [logInvii, setLogInvii] = useState<LogInvio[]>(() => read('log_invii', []));
   const [currentStep, setCurrentStep] = useState<number>(() => read('step', 0));
   useEffect(() => {
-    if (binary) setCvFileState({ file: null, uid: binary.uid, fileName: binary.filename,
-      base64Data: binary.base64, mimeType: binary.mimeType, contentHash: binary.contentHash });
-  }, [binary]);
+    if (binary) {
+      setCvFileState({
+        file: null, uid: binary.uid, fileName: binary.filename,
+        base64Data: binary.base64, mimeType: binary.mimeType, contentHash: binary.contentHash
+      });
+    } else if (uid) {
+      void loadCvBinary(uid).then(loaded => {
+        if (loaded?.base64) {
+          setCvFileState(prev => prev.base64Data ? prev : {
+            file: null, uid: loaded.uid, fileName: loaded.filename,
+            base64Data: loaded.base64, mimeType: loaded.mimeType, contentHash: loaded.contentHash
+          });
+        }
+      }).catch(() => {});
+    }
+  }, [binary, uid]);
   useEffect(() => {
     if (!uid) return;
     try {

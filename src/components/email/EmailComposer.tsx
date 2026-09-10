@@ -7,6 +7,14 @@ import { useUserProfile } from '@/hooks/useUserProfile';
 import { aiAgent, EmailTemplate as AIEmailTemplate } from '@/lib/api/ai-agent';
 import { useEmailOAuth, EmailProvider } from '@/hooks/useEmailOAuth';
 import { getVerifiedCvAttachment, StoredCVAttachment } from '@/lib/cvStorage';
+import {
+  hasValidPermessoG,
+  hasImmediateAvailability,
+  formatCandidateSignature,
+  enforceEmailBodyRules,
+  auditEmailPreSend,
+  buildPermitAndAvailabilityClause,
+} from '@/lib/emailRules';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -317,10 +325,12 @@ export function EmailComposer() {
       );
 
       if (result.data) {
+        const cleanedCorpo = enforceEmailBodyRules(result.data.corpo || '', cvData);
+        const cleanedFirma = formatCandidateSignature(cvData, 'text');
         setCurrentEmail({
           oggetto: result.data.oggetto,
-          corpo: result.data.corpo,
-          firma: result.data.firma,
+          corpo: cleanedCorpo,
+          firma: cleanedFirma,
           matchPoints: result.data.matchPoints,
         });
 
@@ -331,25 +341,24 @@ export function EmailComposer() {
       }
     } catch (error: any) {
       console.warn('Notice in generating email:', error);
-      // Factual, concise fallback template (100-160 words, clean signature on separate lines)
       const fullName = [cvData.nome, cvData.cognome].filter(Boolean).join(' ') || profile?.full_name || '';
       const role = cvData.profilo || profile?.title || '';
-      const city = cvData.citta || profile?.city || '';
-      const phone = cvData.telefono || profile?.phone || '';
-      const email = cvData.email || profile?.email || '';
+      const hasPermit = hasValidPermessoG(cvData);
+      const hasImmediate = hasImmediateAvailability(cvData);
+      const permitAvailClause = buildPermitAndAvailabilityClause(hasPermit, hasImmediate, 'html');
 
-      const fallbackCorpo = `Gentile Responsabile delle Risorse Umane di <b>${selectedAzienda.nome}</b>,<br><br>desidero sottoporre la mia candidatura spontanea per il vostro organico a ${selectedAzienda.citta || 'sede'}.<br><br>Opero come <b>${role}</b>${cvData.competenze && cvData.competenze.length > 0 ? ` con competenze in ${cvData.competenze.slice(0, 3).join(', ')}` : ''}.<br><br>In allegato trasmetto il mio Curriculum Vitae aggiornato per una vostra valutazione. Resto a completa disposizione per un colloquio conoscitivo.<br><br>Cordiali saluti,`;
+      const rawCorpo = `Gentile Responsabile delle Risorse Umane di ${selectedAzienda.nome},<br><br>` +
+        `desidero sottoporre la mia candidatura spontanea per il vostro organico a ${selectedAzienda.citta || 'sede'}.<br><br>` +
+        `${role ? `Opero come ${role}. ` : ''}${cvData.competenze && cvData.competenze.length > 0 ? `Nel mio percorso ho maturato competenze pratiche in ${cvData.competenze.slice(0, 3).join(', ')}.` : ''}` +
+        `${permitAvailClause ? `<br><br>${permitAvailClause}` : ''}<br><br>` +
+        `In allegato trasmetto il mio Curriculum Vitae aggiornato per una vostra valutazione. Resto a completa disposizione per un colloquio conoscitivo.<br><br>` +
+        `Ringraziandovi per l'attenzione, porgo cordiali saluti.`;
 
-      const fallbackFirma = [
-        fullName,
-        role,
-        email ? `Email: ${email}` : '',
-        phone ? `Tel: ${phone}` : '',
-        city ? `Località: ${city}` : '',
-      ].filter(Boolean).join('\n');
+      const fallbackCorpo = enforceEmailBodyRules(rawCorpo, cvData);
+      const fallbackFirma = formatCandidateSignature(cvData, 'text');
 
       setCurrentEmail({
-        oggetto: `Candidatura spontanea – ${role} – ${fullName}`,
+        oggetto: `Candidatura spontanea – ${role || 'Operativo'} – ${fullName}`,
         corpo: fallbackCorpo,
         firma: fallbackFirma,
       });
@@ -370,19 +379,44 @@ export function EmailComposer() {
     await connect(provider);
   };
 
-  // Pre-send validation criteria
+  // Pre-send validation criteria with centralized audit
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   const isDestinatarioOk = Boolean(selectedAzienda?.email && emailRegex.test(selectedAzienda.email.trim()));
   const isOggettoOk = Boolean(currentEmail?.oggetto && currentEmail.oggetto.trim().length > 0);
   const plainCorpo = currentEmail?.corpo ? toPlainText(currentEmail.corpo).trim() : '';
   const wordCount = plainCorpo ? plainCorpo.split(/\s+/).filter(Boolean).length : 0;
   const isCorpoOk = Boolean(plainCorpo.length >= 25 && wordCount >= 30);
-  const plainFirma = currentEmail?.firma ? currentEmail.firma.trim() : '';
-  const isFirmaOk = Boolean(plainFirma.length >= 5);
   const isCvAttachmentOk = attachCV ? (verifiedCv.status === 'ready' && !!verifiedCv.attachment?.base64) : true;
   const isCurrentCompanyBlacklisted = selectedAzienda?.email ? isBlacklisted(selectedAzienda.email).isBlacklisted : false;
   const currentBlacklistReason = selectedAzienda?.email ? isBlacklisted(selectedAzienda.email).reason : undefined;
-  const isPreSendValid = isDestinatarioOk && isOggettoOk && isCorpoOk && isFirmaOk && isCvAttachmentOk && !isCurrentCompanyBlacklisted;
+
+  const preSendAudit = auditEmailPreSend({
+    to: selectedAzienda?.email || '',
+    subject: currentEmail?.oggetto || '',
+    corpo: currentEmail?.corpo || '',
+    firma: currentEmail?.firma || '',
+    cvData: cvData || {},
+    hasAttachment: isCvAttachmentOk,
+    isBlacklisted: isCurrentCompanyBlacklisted,
+  });
+
+  const isFirmaOk = preSendAudit.signatureCorrect;
+  const isPreSendValid = preSendAudit.isValid;
+
+  const handleApplyRules = () => {
+    if (!currentEmail || !cvData) return;
+    const enforcedCorpo = enforceEmailBodyRules(currentEmail.corpo, cvData);
+    const enforcedFirma = formatCandidateSignature(cvData, 'text');
+    setCurrentEmail({
+      ...currentEmail,
+      corpo: enforcedCorpo,
+      firma: enforcedFirma,
+    });
+    toast({
+      title: 'Regole email applicate!',
+      description: 'Permesso G, disponibilità immediata, grassetti conformi e firma aggiornati.',
+    });
+  };
 
   const handleSendEmail = async () => {
     if (!selectedAzienda || !currentEmail) return;
@@ -458,6 +492,16 @@ export function EmailComposer() {
       return;
     }
 
+    // Pre-send validation audit check (Regole Tassative)
+    if (!preSendAudit.isValid) {
+      toast({
+        title: 'Invio bloccato - Controlli non superati',
+        description: preSendAudit.errors[0] || 'L\'email non rispetta tutti i requisiti obbligatori della checklist.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
     const activeProvider = getActiveProvider();
     if (!activeProvider) {
       toast({
@@ -486,13 +530,13 @@ export function EmailComposer() {
     setIsSending(true);
     
     try {
-      // Signature with proper line-breaks for HTML email so lines don't get squashed
-      const formattedFirmaHtml = currentEmail.firma
-        .split('\n')
-        .map(line => line.trim())
-        .filter(line => line.length > 0)
-        .join('<br>');
-      const fullBodyHtml = `${currentEmail.corpo}<br><br>${formattedFirmaHtml}`;
+      // Sanitize body HTML (convert markdown bolding to strong tags, strip stray asterisks)
+      const cleanCorpoHtml = currentEmail.corpo
+        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*/g, '');
+      // Format signature according to strict candidate signature rules
+      const formattedFirmaHtml = formatCandidateSignature(cvData, 'html');
+      const fullBodyHtml = `${cleanCorpoHtml}<br><br>${formattedFirmaHtml}`;
 
       const result = await sendOAuthEmail(
         activeProvider,
@@ -511,15 +555,17 @@ export function EmailComposer() {
         throw new Error(result.error);
       }
 
-      // Record the sent email in database
+      // Record the sent email in database with Gmail messageId as idempotency key
       await aiAgent.recordSentEmail(
-        null,
+        selectedAzienda.id || null,
         selectedAzienda.nome,
         selectedAzienda.email,
         currentEmail.oggetto,
         fullBodyHtml,
-        'v1',
-        requireUid(user?.id)
+        attachmentPayload.filename || 'CV.pdf',
+        requireUid(user?.id),
+        result.messageId,
+        result.threadId
       );
 
       // Track for anti-spam
@@ -848,10 +894,9 @@ export function EmailComposer() {
                           className="min-h-[140px] p-3.5 border rounded-md bg-muted/20 text-sm leading-relaxed text-foreground"
                           dangerouslySetInnerHTML={{ 
                             __html: currentEmail.corpo
-                              .replace(/</g, '&lt;')
-                              .replace(/>/g, '&gt;')
-                              .replace(/&lt;b&gt;/g, '<b>')
-                              .replace(/&lt;\/b&gt;/g, '</b>')
+                              .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                              .replace(/\*/g, '')
+                              .replace(/\n\n/g, '<br><br>')
                               .replace(/\n/g, '<br>')
                           }}
                         />
@@ -926,49 +971,115 @@ export function EmailComposer() {
                       </div>
                     </div>
 
-                    {/* Pre-Send Validation Checklist */}
+                    {/* Pre-Send Validation Checklist (Regole Tassative) */}
                     <div className="rounded-lg border bg-muted/25 p-4 space-y-3">
-                      <div className="flex items-center justify-between">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                         <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-1.5">
                           <Shield className="h-3.5 w-3.5 text-primary" />
-                          Validazione Prima dell'Invio
+                          Controllo Prima dell'Invio (Checklist Tassativa)
                         </span>
-                        <Badge 
-                          variant={isPreSendValid ? 'default' : 'secondary'} 
-                          className={isPreSendValid ? 'bg-emerald-600 hover:bg-emerald-700 text-white text-xs' : 'text-xs'}
-                        >
-                          {isPreSendValid ? '✓ Tutti i 5 requisiti soddisfatti' : 'Verifica requisiti in corso'}
-                        </Badge>
+                        <div className="flex items-center gap-2">
+                          {!isPreSendValid && (
+                            <Button 
+                              type="button" 
+                              size="sm" 
+                              variant="outline" 
+                              className="h-7 text-xs gap-1 border-primary/40 text-primary hover:bg-primary/10"
+                              onClick={handleApplyRules}
+                            >
+                              <Sparkles className="h-3 w-3" />
+                              Applica Regole
+                            </Button>
+                          )}
+                          <Badge 
+                            variant={isPreSendValid ? 'default' : 'secondary'} 
+                            className={isPreSendValid ? 'bg-emerald-600 hover:bg-emerald-700 text-white text-xs' : 'text-xs'}
+                          >
+                            {isPreSendValid ? '✓ Tutti i requisiti soddisfatti' : `${preSendAudit.errors.length} controlli da completare`}
+                          </Badge>
+                        </div>
                       </div>
 
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
-                        {/* 1. Destinatario */}
-                        <div className={`flex items-center gap-2 p-2 rounded-md border ${isDestinatarioOk ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
-                          {isDestinatarioOk ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
+                        {/* 1. Permesso G citato */}
+                        <div className={`flex items-center gap-2 p-2 rounded-md border ${preSendAudit.permessoGCitedCorrectly ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
+                          {preSendAudit.permessoGCitedCorrectly ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
+                          <span className="truncate">
+                            Permesso G: {hasValidPermessoG(cvData) ? 'Presente nel CV (citato)' : 'Assente nel CV (non citato)'}
+                          </span>
+                        </div>
+
+                        {/* 2. Permesso G in grassetto */}
+                        <div className={`flex items-center gap-2 p-2 rounded-md border ${preSendAudit.permessoGBoldCorrectly ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
+                          {preSendAudit.permessoGBoldCorrectly ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
+                          <span className="truncate">
+                            Permesso G grassetto: {hasValidPermessoG(cvData) ? '<strong>permesso G</strong>' : 'Non richiesto'}
+                          </span>
+                        </div>
+
+                        {/* 3. Disponibilità immediata citata */}
+                        <div className={`flex items-center gap-2 p-2 rounded-md border ${preSendAudit.disponibilitaCitedCorrectly ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
+                          {preSendAudit.disponibilitaCitedCorrectly ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
+                          <span className="truncate">
+                            Disponibilità immediata: {hasImmediateAvailability(cvData) ? 'Dichiarata (citata)' : 'Non dichiarata (non inventata)'}
+                          </span>
+                        </div>
+
+                        {/* 4. Disponibilità immediata in grassetto */}
+                        <div className={`flex items-center gap-2 p-2 rounded-md border ${preSendAudit.disponibilitaBoldCorrectly ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
+                          {preSendAudit.disponibilitaBoldCorrectly ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
+                          <span className="truncate">
+                            Disponibilità grassetto: {hasImmediateAvailability(cvData) ? '<strong>disponibile a iniziare da subito</strong>' : 'Non richiesta'}
+                          </span>
+                        </div>
+
+                        {/* 5. Nessun asterisco Markdown */}
+                        <div className={`flex items-center gap-2 p-2 rounded-md border ${!preSendAudit.hasMarkdownAsterisks ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
+                          {!preSendAudit.hasMarkdownAsterisks ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
+                          <span className="truncate">
+                            Markdown asterischi: {!preSendAudit.hasMarkdownAsterisks ? 'Nessun asterisco visibile' : 'Rilevati asterischi (**) da rimuovere'}
+                          </span>
+                        </div>
+
+                        {/* 6. Firma presente */}
+                        <div className={`flex items-center gap-2 p-2 rounded-md border ${preSendAudit.signatureCorrect ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
+                          {preSendAudit.signatureCorrect ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
+                          <span className="truncate">
+                            Firma candidato: {preSendAudit.signatureCorrect ? 'Presente e pulita' : 'Formato non conforme'}
+                          </span>
+                        </div>
+
+                        {/* 7. Nome e cognome corretti */}
+                        <div className={`flex items-center gap-2 p-2 rounded-md border ${preSendAudit.nameCorrect ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
+                          {preSendAudit.nameCorrect ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
+                          <span className="truncate">
+                            Nome e cognome: {[cvData?.nome, cvData?.cognome].filter(Boolean).join(' ') || 'Dati reali CV'}
+                          </span>
+                        </div>
+
+                        {/* 8. Telefono */}
+                        <div className={`flex items-center gap-2 p-2 rounded-md border ${preSendAudit.phoneCorrect ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
+                          {preSendAudit.phoneCorrect ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
+                          <span className="truncate">
+                            Telefono: {cvData?.telefono ? `Tel. ${cvData.telefono}` : 'Non indicato nel CV (omesso)'}
+                          </span>
+                        </div>
+
+                        {/* Destinatario */}
+                        <div className={`flex items-center gap-2 p-2 rounded-md border ${preSendAudit.isDestinatarioOk ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
+                          {preSendAudit.isDestinatarioOk ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
                           <span className="truncate">Destinatario: {selectedAzienda.email}</span>
                         </div>
 
-                        {/* 2. Oggetto */}
-                        <div className={`flex items-center gap-2 p-2 rounded-md border ${isOggettoOk ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
-                          {isOggettoOk ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
+                        {/* Oggetto */}
+                        <div className={`flex items-center gap-2 p-2 rounded-md border ${preSendAudit.isOggettoOk ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
+                          {preSendAudit.isOggettoOk ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
                           <span className="truncate">Oggetto: {currentEmail.oggetto ? 'Definito' : 'Vuoto'}</span>
                         </div>
 
-                        {/* 3. Corpo email */}
-                        <div className={`flex items-center gap-2 p-2 rounded-md border ${isCorpoOk ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
-                          {isCorpoOk ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
-                          <span className="truncate">Corpo email: {wordCount} parole {wordCount >= 100 && wordCount <= 160 ? '(ottimale)' : ''}</span>
-                        </div>
-
-                        {/* 4. Firma candidato */}
-                        <div className={`flex items-center gap-2 p-2 rounded-md border ${isFirmaOk ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
-                          {isFirmaOk ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
-                          <span className="truncate">Firma candidato: {isFirmaOk ? 'Presente' : 'Mancante'}</span>
-                        </div>
-
-                        {/* 5. CV allegato */}
-                        <div className={`flex items-center gap-2 p-2 rounded-md border sm:col-span-2 ${isCvAttachmentOk ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
-                          {isCvAttachmentOk ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
+                        {/* CV allegato */}
+                        <div className={`flex items-center gap-2 p-2 rounded-md border sm:col-span-2 ${preSendAudit.isCvAttachmentOk ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-800 dark:text-emerald-300' : 'bg-destructive/10 border-destructive/30 text-destructive'}`}>
+                          {preSendAudit.isCvAttachmentOk ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="h-4 w-4 shrink-0 text-destructive" />}
                           <span className="truncate">
                             CV allegato: {verifiedCv.attachment ? `${verifiedCv.attachment.filename} (${Math.round((verifiedCv.attachment.base64.length * 0.75) / 1024)} KB) allegato` : 'Non allegato o mancante'}
                           </span>
@@ -976,11 +1087,16 @@ export function EmailComposer() {
                       </div>
 
                       {!isPreSendValid && (
-                        <div className="p-2 bg-destructive/10 border border-destructive/20 rounded text-xs text-destructive flex items-center gap-2">
-                          <AlertTriangle className="h-4 w-4 shrink-0" />
-                          <span>
-                            L'invio è bloccato finché tutti i requisiti obbligatori non risultano verificati.
-                          </span>
+                        <div className="p-2.5 bg-destructive/10 border border-destructive/20 rounded text-xs text-destructive space-y-1">
+                          <div className="flex items-center gap-1.5 font-medium">
+                            <AlertTriangle className="h-4 w-4 shrink-0" />
+                            <span>L'invio è bloccato finché tutti i requisiti obbligatori non risultano verificati:</span>
+                          </div>
+                          <ul className="list-disc list-inside text-[11px] pl-1 space-y-0.5">
+                            {preSendAudit.errors.map((err, i) => (
+                              <li key={i}>{err}</li>
+                            ))}
+                          </ul>
                         </div>
                       )}
                     </div>

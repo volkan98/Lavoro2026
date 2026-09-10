@@ -1,5 +1,5 @@
 import { useState, useEffect, createContext, useContext, ReactNode, Fragment } from 'react';
-import { auth } from '@/lib/firebase';
+import { auth, logFirebaseConfigDiagnostics } from '@/lib/firebase';
 import { GoogleAuthProvider, onIdTokenChanged, signInWithPopup, signInWithEmailAndPassword,
   createUserWithEmailAndPassword, updateProfile, signOut as firebaseSignOut } from 'firebase/auth';
 import { clearGmailToken } from '@/lib/workspaceAuth';
@@ -42,6 +42,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const canonical = { id: firebaseUser.uid, email: firebaseUser.email || '',
           user_metadata: { full_name: firebaseUser.displayName || '' } };
         setUser(canonical); setSession({ user: canonical, access_token: token });
+        logFirebaseConfigDiagnostics();
       } catch {
         if (current === revision) { setUser(null); setSession(null); }
       } finally { if (current === revision) setLoading(false); }

@@ -15,7 +15,13 @@ const external = vi.hoisted(() => ({
   auth: { currentUser: null as any }, docs: new Map<string, any>(), listeners: new Set<(user: any) => void>(),
   writes: [] as string[], reads: [] as string[], failRead: false, failWrite: false, nextUser: null as any,
 }));
-vi.mock('@/lib/firebase', () => ({ auth: external.auth, db: {} }));
+vi.mock('@/lib/firebase', () => ({
+  auth: external.auth,
+  db: {},
+  databaseId: '(default)',
+  logFirebaseConfigDiagnostics: vi.fn(),
+  logFirestoreReadDiagnostics: vi.fn(),
+}));
 vi.mock('firebase/auth', () => ({
   GoogleAuthProvider: class {},
   onIdTokenChanged: (_auth: any, callback: any) => {
@@ -36,6 +42,11 @@ vi.mock('firebase/firestore', () => ({
   doc: (_db: any, ...segments: string[]) => ({ path: segments.join('/') }),
   collection: (_db: any, ...segments: string[]) => ({ path: segments.join('/') }),
   getDocFromServer: async (ref: any) => {
+    external.reads.push(ref.path);
+    if (external.failRead) throw new Error('Cloud offline');
+    return snapshot(ref);
+  },
+  getDoc: async (ref: any) => {
     external.reads.push(ref.path);
     if (external.failRead) throw new Error('Cloud offline');
     return snapshot(ref);
@@ -303,5 +314,18 @@ describe('Additional failure and original-attachment regression coverage', () =>
     expect(getCachedGmailToken()).toBeNull();
     sessionStorage.setItem(`ais_workspace_gmail_${uid}`, JSON.stringify({ uid, email: 'fixture@example.test', token: 'expired', expiresAt: Date.now() - 1 }));
     expect(getCachedGmailToken()).toBeNull();
+  });
+  it('Firestore client offline error throws user-friendly deploy message instead of raw Firebase offline error when un-cached', async () => {
+    external.failRead = true;
+    await expect(readCvSnapshot(uid)).rejects.toThrow('Impossibile collegarsi a Firestore. Verifica la configurazione del deploy.');
+    external.failRead = false;
+  });
+  it('Firestore offline error gracefully falls back to same-UID cache without inventing data', async () => {
+    await writeCvSnapshot(uid, expected);
+    external.failRead = true;
+    const result = await readCvSnapshot(uid);
+    expect(result.source).toBe('cache');
+    expect(result.document.cvParsedData?.nome).toBe(expected.nome);
+    external.failRead = false;
   });
 });

@@ -10,11 +10,15 @@ export interface CVData {
   patente?: string;
   profilo: string;
   competenze: string[];
+  competenzeTecniche?: string[];
+  competenzeInformatiche?: string[];
   esperienze: Esperienza[];
   istruzione: Istruzione[];
   lingue: Lingua[];
   certificazioni?: string[];
   altreInformazioni?: string[];
+  disponibilita?: string;
+  disponibileImmediato?: boolean;
   targetRole?: string;
   permessoG?: boolean | string;
   statoPermesso?: string;

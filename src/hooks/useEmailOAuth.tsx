@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from './useAuth';
 import { useToast } from './use-toast';
-import { connectGmailAccount, disconnectGmailAccount, sendViaGmailApi, getCachedGmailToken, getCachedGmailEmail, initWorkspaceAuth } from '@/lib/workspaceAuth';
+import { connectGmailAccount, disconnectGmailAccount, sendViaGmailApi, getCachedGmailToken, getCachedGmailEmail, initWorkspaceAuth, fetchValidGmailToken } from '@/lib/workspaceAuth';
 import { getVerifiedCvAttachment } from '@/lib/cvStorage';
 export type EmailProvider = 'gmail' | 'outlook';
 export interface ConnectedProvider { provider: EmailProvider; email: string; connected: boolean }
@@ -11,8 +11,16 @@ export function useEmailOAuth() {
   const [connectedProviders, setProviders] = useState<ConnectedProvider[]>([]);
   const [isLoading, setLoading] = useState(false);
   const refresh = useCallback(async () => {
-    const email = getCachedGmailEmail();
-    setProviders(user && email && getCachedGmailToken() ? [{ provider: 'gmail', email, connected: true }] : []);
+    let token = getCachedGmailToken();
+    let email = getCachedGmailEmail();
+    
+    if (user && !token) {
+      // Inizializza o valida il token asincronamente prima di decidere se mostrare disconnesso
+      token = await fetchValidGmailToken();
+      email = getCachedGmailEmail();
+    }
+    
+    setProviders(user && email && token ? [{ provider: 'gmail', email, connected: true }] : []);
   }, [user?.id]);
   useEffect(() => {
     const unsubscribe = initWorkspaceAuth(() => { void refresh(); }, () => setProviders([]));

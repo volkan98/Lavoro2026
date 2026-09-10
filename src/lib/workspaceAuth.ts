@@ -1,39 +1,139 @@
+import { apiFetch, safeJsonResponse } from "./api/client";
 import { onAuthStateChanged, type User } from 'firebase/auth';
 import { auth } from './firebase';
 import { requireUid } from './api/client';
 import { verifyOriginalAttachment } from './cvStorage';
 import firebaseConfigJson from '../../firebase-applet-config.json';
 
-export const SCOPES = ['openid', 'email', 'https://www.googleapis.com/auth/gmail.send'];
-type GmailGrant = { uid: string; email: string; token: string; expiresAt: number };
-const key = (uid: string) => `ais_workspace_gmail_${uid}`;
+export const SCOPES = [
+  'openid',
+  'email',
+  'https://www.googleapis.com/auth/gmail.send',
+  'https://www.googleapis.com/auth/gmail.readonly',
+];
+export type GmailGrant = { uid: string; email: string; token: string; expiresAt: number; scopes?: string[] };
 let activeUid: string | null = null;
+let activeGrant: GmailGrant | null = null;
 const changed = () => window.dispatchEvent(new Event('gmail-authorization-changed'));
+
+let isReauthRequired = false;
+let pendingTokenPromise: Promise<string | null> | null = null;
+
 function grant(): GmailGrant | null {
   const uid = auth.currentUser?.uid;
   if (!uid) return null;
-  try {
-    const data = JSON.parse(sessionStorage.getItem(key(uid)) || 'null');
-    if (data?.uid === uid && data.token && data.email && data.expiresAt > Date.now()) return data;
-  } catch { /* Invalid cache is never a grant. */ }
+  
+  if (activeGrant && activeGrant.uid === uid && activeGrant.token && activeGrant.expiresAt > Date.now()) {
+    return activeGrant;
+  }
+  
   return null;
 }
+
+export async function fetchValidGmailToken(): Promise<string | null> {
+  const uid = auth.currentUser?.uid;
+  if (!uid) return null;
+  
+  // Check if we have a valid token in memory
+  if (activeGrant && activeGrant.uid === uid && activeGrant.token && activeGrant.expiresAt > Date.now()) {
+    return activeGrant.token;
+  }
+
+  // Prevent spamming the backend if we already know re-authentication is required
+  if (isReauthRequired) {
+    return null;
+  }
+
+  // Request Collapsing: If there is already an active request fetching the token, reuse it!
+  if (pendingTokenPromise) {
+    return pendingTokenPromise;
+  }
+
+  pendingTokenPromise = (async () => {
+    try {
+      const tokenResponse = await apiFetch('/api/oauth/token', { method: 'GET' });
+      const res = await safeJsonResponse(tokenResponse);
+      
+      if (res.success && res.access_token) {
+        activeGrant = {
+          uid,
+          email: res.email,
+          token: res.access_token,
+          expiresAt: res.expires_at,
+          scopes: res.scopes
+        };
+        activeUid = uid;
+        isReauthRequired = false;
+        changed();
+        return res.access_token;
+      } else if (res.requires_reauth || res.error === 'requires_reauth' || res.error === 'invalid_grant') {
+        console.info('[workspaceAuth] Backend indicated re-authentication is required:', res);
+        activeGrant = null;
+        isReauthRequired = true;
+        changed();
+        return null;
+      }
+    } catch (e: any) {
+      console.warn('[workspaceAuth] Error fetching valid gmail token from backend:', e?.message || e);
+    } finally {
+      pendingTokenPromise = null;
+    }
+    return null;
+  })();
+
+  return pendingTokenPromise;
+}
+
 export const getCachedGmailToken = () => grant()?.token || null;
 export const getCachedGmailEmail = () => grant()?.email || null;
+export const getCachedGmailGrant = () => grant();
+
+export function hasGmailReadScope(): boolean {
+  const g = grant();
+  if (!g || !g.token) return false;
+  if (!g.scopes || g.scopes.length === 0) return true; // optimist fallback if scope array wasn't recorded
+  return g.scopes.some(s =>
+    s.includes('gmail.readonly') ||
+    s.includes('mail.google.com') ||
+    s.includes('gmail.modify')
+  );
+}
+
 export function clearGmailToken() {
+  isReauthRequired = false;
+  pendingTokenPromise = null;
   try {
-    for (const uid of [activeUid, auth.currentUser?.uid]) if (uid) sessionStorage.removeItem(key(uid));
-    for (const old of ['ais_workspace_gmail_token', 'ais_workspace_gmail_email', 'ais_workspace_gmail_expiry']) sessionStorage.removeItem(old);
+    if (activeUid) localStorage.removeItem(`ais_workspace_gmail_${activeUid}`);
+    if (auth.currentUser?.uid) localStorage.removeItem(`ais_workspace_gmail_${auth.currentUser.uid}`);
+    for (const old of ['ais_workspace_gmail_token', 'ais_workspace_gmail_email', 'ais_workspace_gmail_expiry']) localStorage.removeItem(old);
   } catch { /* Cache access must not prevent Firebase logout. */ }
   activeUid = null;
+  activeGrant = null;
+  
+  // Also delete from backend
+  try {
+    if (auth.currentUser) {
+      apiFetch('/api/oauth/token', { method: 'DELETE' }).catch(() => {});
+    }
+  } catch {}
+  
   changed();
 }
 export function initWorkspaceAuth(onSuccess?: (user: User, token: string) => void, onFailure?: () => void) {
-  return onAuthStateChanged(auth, user => {
+  return onAuthStateChanged(auth, async user => {
     if (activeUid && activeUid !== user?.uid) clearGmailToken();
     activeUid = user?.uid || null;
-    const token = getCachedGmailToken();
-    if (user && token) onSuccess?.(user, token); else onFailure?.();
+    
+    if (user) {
+      const token = await fetchValidGmailToken();
+      if (token) {
+        onSuccess?.(user, token);
+      } else {
+        onFailure?.();
+      }
+    } else {
+      onFailure?.();
+    }
   });
 }
 async function ensureGisLoaded() {
@@ -51,31 +151,60 @@ export async function connectGmailAccount(_forceConsent = false): Promise<{ succ
     const uid = requireUid();
     const firebaseUser = auth.currentUser!;
     await ensureGisLoaded();
-    const clientId = (firebaseConfigJson as any).oAuthClientId;
+    const clientId = (firebaseConfigJson as any).oAuthClientId || (import.meta as any).env?.VITE_GOOGLE_OAUTH_CLIENT_ID || '90372536237-3brdejbh42jtjj5o4tlq7gs28ek7t3s7.apps.googleusercontent.com';
     if (!clientId) throw new Error('OAuth Client ID Gmail non configurato');
-    const response: any = await new Promise((resolve, reject) => {
-      const client = (window as any).google.accounts.oauth2.initTokenClient({
-        client_id: clientId, scope: SCOPES.join(' '),
-        callback: (result: any) => result.access_token ? resolve(result) : reject(new Error(result.error_description || result.error || 'Autorizzazione non concessa')),
-        error_callback: () => reject(new Error('Autorizzazione Gmail annullata o popup bloccato. Apri l’app in una nuova scheda e riprova.')),
+    
+    console.info('[workspaceAuth] Initiating GIS code client request...');
+    const gisResult: any = await new Promise((resolve, reject) => {
+      const client = (window as any).google.accounts.oauth2.initCodeClient({
+        client_id: clientId,
+        scope: SCOPES.join(' '),
+        ux_mode: 'popup',
+        access_type: 'offline',
+        prompt: 'consent',
+        callback: (result: any) => result.code ? resolve(result) : reject(new Error(result.error_description || result.error || 'Autorizzazione non concessa')),
+        error_callback: (err: any) => reject(new Error(err?.message || 'Autorizzazione Gmail annullata o popup bloccato. Apri l’app in una nuova scheda e riprova.')),
       });
-      client.requestAccessToken({ prompt: 'consent', login_hint: firebaseUser.email || undefined });
+      client.requestCode({ login_hint: firebaseUser.email || undefined });
     });
+    
+    if (!gisResult || !gisResult.code) {
+      throw new Error('Nessun codice di autorizzazione ottenuto da Google.');
+    }
+
+    console.info('[workspaceAuth] Exchanging auth code with /api/oauth/exchange...');
+    const exchangeResponse = await apiFetch('/api/oauth/exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: gisResult.code })
+    });
+    
+    const res = await safeJsonResponse(exchangeResponse);
+    
+    if (!res.success) {
+      console.error('[workspaceAuth] Code exchange error response:', res);
+      throw new Error(res.error || res.message || 'Errore durante lo scambio del codice di autorizzazione col server.');
+    }
+
     requireUid(uid);
-    if (!(response.scope || '').split(' ').includes('https://www.googleapis.com/auth/gmail.send')) throw new Error('Permesso di invio Gmail non concesso');
-    const result = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: `Bearer ${response.access_token}` } });
-    if (!result.ok) throw new Error('Impossibile verificare l’account Gmail autorizzato');
-    const info = await result.json();
-    requireUid(uid);
-    const googleIdentity = firebaseUser.providerData.find(p => p.providerId === 'google.com');
-    const sameAccount = googleIdentity ? info.sub === googleIdentity.uid
-      : firebaseUser.emailVerified && info.email_verified && info.email?.toLowerCase() === firebaseUser.email?.toLowerCase();
-    if (!sameAccount || !info.email) throw new Error('L’account Gmail deve corrispondere all’utente Firebase che ha effettuato l’accesso.');
-    const data: GmailGrant = { uid, email: info.email, token: response.access_token,
-      expiresAt: Date.now() + Math.max(0, Number(response.expires_in || 0) - 60) * 1000 };
-    sessionStorage.setItem(key(uid), JSON.stringify(data)); activeUid = uid; changed();
+    const data: GmailGrant = {
+      uid,
+      email: res.email,
+      token: res.access_token,
+      expiresAt: res.expires_at,
+      scopes: res.scopes,
+    };
+    
+    activeUid = uid; 
+    activeGrant = data;
+    isReauthRequired = false;
+    pendingTokenPromise = null;
+    changed();
     return { success: true, email: data.email, accessToken: data.token };
-  } catch (error: any) { return { success: false, error: error.message }; }
+  } catch (error: any) {
+    console.error('[workspaceAuth] connectGmailAccount error:', error);
+    return { success: false, error: error.message || 'Errore durante l’autorizzazione Gmail' };
+  }
 }
 export async function disconnectGmailAccount() { clearGmailToken(); }
 
@@ -203,7 +332,7 @@ export async function sendViaGmailApi(
   const checked = await verifyOriginalAttachment(payload.attachment);
   if (!checked.ok) return { success: false, error: checked.error };
   const sendingUid = requireUid();
-  let token = getCachedGmailToken();
+  let token = await fetchValidGmailToken();
 
   // If token is missing, attempt interactive connect ONLY if requested
   if (!token) {
@@ -242,8 +371,8 @@ export async function sendViaGmailApi(
 
     // If unauthorized or insufficient scopes, clear cached token
     if (response.status === 401 || response.status === 403) {
-      const errBody = await response.json().catch(() => ({}));
-      const errMsg = errBody?.error?.message || '';
+      const errBody = await safeJsonResponse(response);
+      const errMsg = errBody?.error?.message || errBody?.error || '';
       console.warn('[GmailApi] Auth error from Gmail API:', response.status, errMsg);
 
       clearGmailToken();
@@ -270,7 +399,7 @@ export async function sendViaGmailApi(
         });
 
         if (retryRes.ok) {
-          const retryData = await retryRes.json();
+          const retryData = await safeJsonResponse(retryRes);
           return {
             success: true,
             messageId: retryData.id,
@@ -278,10 +407,10 @@ export async function sendViaGmailApi(
           };
         }
 
-        const retryErrBody = await retryRes.json().catch(() => ({}));
+        const retryErrBody = await safeJsonResponse(retryRes);
         return {
           success: false,
-          error: retryErrBody?.error?.message || 'Permesso di invio Gmail non concesso. Accetta il permesso nella finestra di autorizzazione.',
+          error: retryErrBody?.error?.message || retryErrBody?.error || 'Permesso di invio Gmail non concesso. Accetta il permesso nella finestra di autorizzazione.',
         };
       }
 
@@ -292,12 +421,12 @@ export async function sendViaGmailApi(
     }
 
     if (!response.ok) {
-      const errorJson = await response.json().catch(() => ({}));
-      const msg = errorJson?.error?.message || `Errore Gmail API (${response.status} ${response.statusText})`;
+      const errorJson = await safeJsonResponse(response);
+      const msg = errorJson?.error?.message || errorJson?.error || `Errore Gmail API (${response.status} ${response.statusText})`;
       return { success: false, error: msg };
     }
 
-    const data = await response.json();
+    const data = await safeJsonResponse(response);
     return {
       success: true,
       messageId: data.id,
@@ -307,6 +436,285 @@ export async function sendViaGmailApi(
     return {
       success: false,
       error: err?.message || 'Errore di connessione con il servizio Gmail',
+    };
+  }
+}
+
+export interface GmailSentMessageInfo {
+  id: string;
+  threadId: string;
+  internalDate: string;
+  sentAt: string;
+  to: string;
+  recipientEmail: string;
+  recipientName: string;
+  domain: string;
+  subject: string;
+  bodySnippet: string;
+  bodyText?: string;
+  bodyHtml?: string;
+  attachments: string[];
+  cvFilename?: string;
+  isOutreach: boolean;
+}
+
+function decodeBase64Url(base64UrlStr: string): string {
+  try {
+    const base64 = base64UrlStr.replace(/-/g, '+').replace(/_/g, '/');
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new TextDecoder('utf-8').decode(bytes);
+  } catch {
+    return '';
+  }
+}
+
+function parseRecipient(toHeader: string): { email: string; name: string } {
+  if (!toHeader) return { email: '', name: '' };
+  const match = toHeader.match(/(.*?)\s*<([^>]+)>/);
+  if (match) {
+    const name = match[1].replace(/["']/g, '').trim();
+    const email = match[2].trim().toLowerCase();
+    return { email, name };
+  }
+  return { email: toHeader.replace(/["']/g, '').trim().toLowerCase(), name: '' };
+}
+
+function extractPartsInfo(payload: any): { attachments: string[]; textBody: string; htmlBody: string } {
+  const attachments: string[] = [];
+  let textBody = '';
+  let htmlBody = '';
+
+  function walk(part: any) {
+    if (!part) return;
+    if (part.filename && part.filename.length > 0) {
+      attachments.push(part.filename);
+    }
+    if (part.mimeType === 'text/plain' && part.body?.data && !textBody) {
+      textBody = decodeBase64Url(part.body.data);
+    }
+    if (part.mimeType === 'text/html' && part.body?.data && !htmlBody) {
+      htmlBody = decodeBase64Url(part.body.data);
+    }
+    if (Array.isArray(part.parts)) {
+      for (const sub of part.parts) {
+        walk(sub);
+      }
+    }
+  }
+
+  if (payload) {
+    walk(payload);
+  }
+
+  return { attachments, textBody, htmlBody };
+}
+
+export async function fetchSentGmailMessages(options?: {
+  maxResults?: number;
+  newerThanDays?: number;
+  knownCompanyDomains?: Set<string>;
+  knownCompanyEmails?: Set<string>;
+}): Promise<{
+  success: boolean;
+  messages: GmailSentMessageInfo[];
+  needsReadAuth?: boolean;
+  error?: string;
+}> {
+  const token = await fetchValidGmailToken();
+  if (!token) {
+    return {
+      success: false,
+      messages: [],
+      error: 'Account Gmail non collegato o sessione scaduta',
+      needsReadAuth: true,
+    };
+  }
+
+  try {
+    // Strictly cap window to max 3 days
+    const days = Math.min(Math.max(Number(options?.newerThanDays) || 3, 1), 3);
+    const query = encodeURIComponent(`in:sent newer_than:${days}d`);
+    const limit = Math.min(options?.maxResults || 50, 50);
+
+    const listRes = await fetch(
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${query}&maxResults=${limit}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+        },
+      }
+    );
+
+    if (listRes.status === 401 || listRes.status === 403) {
+      const err = await safeJsonResponse(listRes);
+      return {
+        success: false,
+        messages: [],
+        needsReadAuth: true,
+        error: err?.error?.message || err?.error || 'Permesso di lettura Gmail non concesso. Autorizza l’accesso per recuperare lo storico.',
+      };
+    }
+
+    if (!listRes.ok) {
+      const err = await safeJsonResponse(listRes);
+      return {
+        success: false,
+        messages: [],
+        error: err?.error?.message || err?.error || `Errore lettura Gmail (${listRes.status})`,
+      };
+    }
+
+    const listData = await safeJsonResponse(listRes);
+    const rawList: { id: string; threadId: string }[] = listData.messages || [];
+    if (rawList.length === 0) {
+      return { success: true, messages: [] };
+    }
+
+    // Code-level hard boundary: exactly 72 hours / 3 days
+    const MAX_LOOKBACK_MS = days * 24 * 60 * 60 * 1000;
+    const cutoffTimeMs = Date.now() - MAX_LOOKBACK_MS;
+
+    const results: GmailSentMessageInfo[] = [];
+    const batchSize = 6;
+    for (let i = 0; i < rawList.length; i += batchSize) {
+      const chunk = rawList.slice(i, i + batchSize);
+      const chunkResults = await Promise.all(
+        chunk.map(async (item) => {
+          try {
+            const msgRes = await fetch(
+              `https://gmail.googleapis.com/gmail/v1/users/me/messages/${item.id}?format=full`,
+              {
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  Accept: 'application/json',
+                },
+              }
+            );
+            if (!msgRes.ok) return null;
+            const msgData = await safeJsonResponse(msgRes);
+            const headers = msgData.payload?.headers || [];
+            const getHeader = (name: string) =>
+              headers.find((h: any) => h.name.toLowerCase() === name.toLowerCase())?.value || '';
+
+            const to = getHeader('To');
+            const subject = getHeader('Subject');
+            const dateStr = getHeader('Date');
+            const { email: recipientEmail, name: recipientName } = parseRecipient(to);
+            const domain = recipientEmail.includes('@') ? recipientEmail.split('@')[1].toLowerCase().trim() : '';
+
+            const internalMs = Number(msgData.internalDate);
+            const messageTimeMs = !isNaN(internalMs) && internalMs > 0
+              ? internalMs
+              : (dateStr ? new Date(dateStr).getTime() : 0);
+
+            // HARD CODE-LEVEL BARRIER: Discard anything older than 3 days / 72 hours
+            if (!messageTimeMs || messageTimeMs < cutoffTimeMs) {
+              return null;
+            }
+
+            const sentAt = new Date(messageTimeMs).toISOString();
+
+            const { attachments, textBody, htmlBody } = extractPartsInfo(msgData.payload);
+            const bodySnippet = (msgData.snippet || textBody || htmlBody || '').slice(0, 1000);
+
+            // Check if recipient is a saved company in the app
+            const matchesKnownCompany = Boolean(
+              (options?.knownCompanyEmails && options.knownCompanyEmails.has(recipientEmail.toLowerCase())) ||
+              (domain && options?.knownCompanyDomains && options.knownCompanyDomains.has(domain))
+            );
+
+            // Check if sent using the Lavoro2026 app
+            const matchesAppTemplate = Boolean(
+              getHeader('X-Mailer').includes('Lavoro2026') ||
+              htmlBody.includes('Lavoro2026') ||
+              textBody.includes('Lavoro2026') ||
+              (htmlBody.includes('-apple-system, BlinkMacSystemFont') && htmlBody.includes('font-family'))
+            );
+
+            // Filter out obvious administrative, municipal, or utility emails (unless sent via the app)
+            const isAdministrativeOrPersonal =
+              /comoacqua|oxford|comune\.|demografic|servizio.*clienti|fattur|bollett|utenza|recupero.*credit|newsletter|no-?reply|assistenza|support@|ricevuta|ordine|conferma.*ordine|bonifico|inps|agenzia.*entrate/i.test(
+                `${recipientEmail} ${recipientName} ${subject}`
+              );
+
+            const subjectLower = (subject || '').toLowerCase();
+            const bodyLower = `${bodySnippet} ${textBody}`.toLowerCase();
+
+            const hasApplicationSubject =
+              subjectLower.includes('candidatura') ||
+              subjectLower.includes('curriculum') ||
+              subjectLower.includes('cv') ||
+              subjectLower.includes('lettera di presentazione') ||
+              subjectLower.includes('application') ||
+              subjectLower.includes('autocandidatura');
+
+            const hasApplicationBody =
+              bodyLower.includes('candidatura') ||
+              bodyLower.includes('curriculum vitae') ||
+              bodyLower.includes('allego il mio cv') ||
+              bodyLower.includes('allego curriculum') ||
+              bodyLower.includes('in allegato il mio cv') ||
+              bodyLower.includes('risorse umane') ||
+              bodyLower.includes('spontaneous application');
+
+            const cvFilename = attachments.find((f) => {
+              const fn = f.toLowerCase();
+              return fn.endsWith('.pdf') && (fn.includes('cv') || fn.includes('curriculum') || fn.includes('resume') || fn.includes('profilo'));
+            }) || attachments.find((f) => f.toLowerCase().endsWith('.pdf'));
+
+            // Balanced outreach classification:
+            // 1. Matches app template/headers -> always outreach
+            // 2. Matches known company saved by user -> always outreach
+            // 3. Otherwise: must NOT be administrative/personal AND must have genuine application signals
+            const isOutreach = Boolean(
+              matchesAppTemplate ||
+              matchesKnownCompany ||
+              (!isAdministrativeOrPersonal && (
+                (hasApplicationSubject && (Boolean(cvFilename) || hasApplicationBody)) ||
+                (hasApplicationSubject) ||
+                (Boolean(cvFilename) && hasApplicationBody)
+              ))
+            );
+
+            return {
+              id: msgData.id,
+              threadId: msgData.threadId || item.threadId,
+              internalDate: msgData.internalDate,
+              sentAt,
+              to,
+              recipientEmail,
+              recipientName,
+              domain,
+              subject,
+              bodySnippet,
+              bodyText: textBody,
+              bodyHtml: htmlBody,
+              attachments,
+              cvFilename,
+              isOutreach,
+            };
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      for (const res of chunkResults) {
+        if (res) results.push(res);
+      }
+    }
+
+    return { success: true, messages: results };
+  } catch (err: any) {
+    return {
+      success: false,
+      messages: [],
+      error: err?.message || 'Errore di comunicazione con Gmail',
     };
   }
 }

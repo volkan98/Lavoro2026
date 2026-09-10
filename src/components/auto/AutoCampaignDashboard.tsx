@@ -395,9 +395,9 @@ function CampaignDashboard({
 
   // Pacing calculations
   const today = getTodayDateString();
-  const dailySent = pacingState?.dailyDate === today
-    ? pacingState.dailySentCount
-    : (campaign?.daily_date === today ? (campaign.daily_sent_count || 0) : 0);
+  const pacingDaily = pacingState?.dailyDate === today ? (pacingState.dailySentCount || 0) : 0;
+  const campaignDaily = campaign?.daily_date === today ? (campaign.daily_sent_count || 0) : 0;
+  const dailySent = Math.max(pacingDaily, campaignDaily);
 
   const dailyRemaining = Math.max(0, PACING_CONSTANTS.DAILY_MAX_SENDS - dailySent);
   const targetRemaining = Math.max(0, (campaign?.target_total || 50) - (campaign?.total_sent || 0));
@@ -918,11 +918,11 @@ function QueueStatusBadge({ status }: { status: string }) {
 
 export function AutoCampaignDashboard() {
   const { cvData, cvFileState, sintesiBreve, setCurrentStep } = useCVContext();
-  const { profile, hasSavedCV } = useUserProfile();
+  const { profile, hasSavedCV, binary } = useUserProfile();
   const autoCampaign = useAutoCampaign();
   const { campaign, isLoading, startCampaign } = autoCampaign;
 
-  if (isLoading) {
+  if (isLoading && !campaign) {
     return (
       <div className="flex flex-col items-center justify-center py-16 gap-3">
         <Loader2 className="h-8 w-8 animate-spin text-primary" />
@@ -931,7 +931,7 @@ export function AutoCampaignDashboard() {
     );
   }
 
-  const hasCv = hasSavedCV && Boolean(cvFileState?.base64Data);
+  const hasCv = hasSavedCV && (Boolean(cvFileState?.base64Data) || Boolean(binary?.base64) || Boolean(profile?.cv_file_path));
 
   if (!hasCv) {
     return (
@@ -950,7 +950,7 @@ export function AutoCampaignDashboard() {
     );
   }
 
-  if (campaign && ['running', 'paused', 'completed', 'stopped'].includes(campaign.status)) {
+  if (campaign && typeof campaign === 'object' && (campaign.id || campaign.search_location || ['running', 'paused', 'completed', 'stopped', 'idle', 'error'].includes(campaign.status))) {
     return <CampaignDashboard {...autoCampaign} />;
   }
 

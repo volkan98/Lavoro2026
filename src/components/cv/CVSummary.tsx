@@ -27,7 +27,7 @@ import {
   Loader2
 } from 'lucide-react';
 
-import { summarizeCv, hasCvData } from '@/lib/cvNormalizer';
+import { summarizeCv, hasCvData, isPlaceholder } from '@/lib/cvNormalizer';
 
 export function CVSummary() {
   const { cvData, setCvData, setSintesiBreve, setSintesiCompleta, sintesiBreve, sintesiCompleta, setCurrentStep } = useCVContext();
@@ -58,6 +58,12 @@ export function CVSummary() {
     const summaries = summarizeCv(editedData);
     setSintesiBreve(summaries.sintesiBreve);
     setSintesiCompleta(summaries.sintesiCompleta);
+    if (!editedData.profilo && summaries.profilo) {
+      setEditedData({
+        ...editedData,
+        profilo: summaries.profilo,
+      });
+    }
     setIsGenerating(false);
   };
 
@@ -83,10 +89,18 @@ export function CVSummary() {
   const handleNext = async () => {
     if (!editedData) return;
     
-    setCvData(editedData);
+    // Ensure placeholder strings are converted to empty string before saving
+    const toSave = { ...editedData };
+    for (const key of Object.keys(toSave) as (keyof typeof toSave)[]) {
+      if (typeof toSave[key] === 'string' && isPlaceholder(toSave[key] as string)) {
+        (toSave as any)[key] = '';
+      }
+    }
+
+    setCvData(toSave);
     
     // Save to database
-    const result = await saveProfile(editedData, sintesiBreve, sintesiCompleta);
+    const result = await saveProfile(toSave, sintesiBreve, sintesiCompleta);
     
     if (result.success) {
       toast({

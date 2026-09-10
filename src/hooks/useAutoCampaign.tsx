@@ -1,17 +1,28 @@
-import { scopedStorageKey } from '@/lib/api/client';
-import { requireUid } from '@/lib/api/client';
-import { apiFetch } from '@/lib/api/client';
+import { scopedStorageKey, requireUid, apiFetch, sanitizeForFirestore, safeJsonResponse } from '@/lib/api/client';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from '@/hooks/useAuth';
 import { useToast } from '@/hooks/use-toast';
 import { db } from '@/lib/firebase';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { doc, getDoc, setDoc, deleteDoc, collection, getDocs, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
 import { aiAgent, Company } from '@/lib/api/ai-agent';
 import { useCVContext } from '@/contexts/CVContext';
 import { useUserProfile } from '@/hooks/useUserProfile';
-import { isEmailBlacklisted, BlacklistEntry, STORAGE_KEY_BLACKLIST } from '@/lib/blacklist';
+import { isEmailBlacklisted, BlacklistEntry, fetchFirestoreBlacklist } from '@/lib/blacklist';
+import {
+  fetchFirestoreSentEmailsHistory,
+  isCompanyMatchSentRecord,
+  extractEmailDomain,
+  isGenericEmailDomain,
+  normalizeCompanyName,
+  normalizeCompanyId,
+} from '@/lib/companyDeduplication';
 import { sendViaGmailApi } from '@/lib/workspaceAuth';
-import { getVerifiedCvAttachment } from '@/lib/cvStorage';
+import { getVerifiedCvAttachment, loadCvBinary } from '@/lib/cvStorage';
+import {
+  enforceEmailBodyRules,
+  formatCandidateSignature,
+  auditEmailPreSend,
+} from '@/lib/emailRules';
 import {
   PACING_CONSTANTS,
   PacingState,
@@ -22,10 +33,17 @@ import {
   recordSendSuccess,
   recordSendError,
   generateVariedEmail,
-  isGmailFatalOrSuspiciousError,
   getTodayDateString,
   cleanHourlyTimestamps,
+  getRandomBlockTarget,
 } from '@/lib/campaignPacing';
+
+export interface CampaignRunnerLock {
+  tab_id: string;
+  heartbeat_at: number; // timestamp in ms
+  claimed_at: string;
+  origin?: string;
+}
 
 export interface Campaign {
   id: string;
@@ -53,12 +71,15 @@ export interface Campaign {
   created_at: string;
   updated_at: string;
 
-  // Anti-spam gradual pacing fields
+  // Anti-spam gradual pacing fields synced in Cloud
   daily_date?: string;
   daily_sent_count?: number;
   gmail_error?: string | null;
   active_pause_type?: PauseType;
   hourly_sent_count?: number;
+
+  // Single authoritative runner lock across Preview and Production
+  runner_lock?: CampaignRunnerLock | null;
 }
 
 export interface CampaignEvent {
@@ -74,6 +95,7 @@ export interface QueueItem {
   id: string;
   campaign_id?: string;
   user_id?: string;
+  company_id?: string | null;
   company_name: string;
   company_email: string;
   company_city: string | null;
@@ -83,6 +105,8 @@ export interface QueueItem {
   confidence_score: number;
   error_message?: string | null;
   sent_at?: string | null;
+  gmail_message_id?: string | null;
+  gmail_thread_id?: string | null;
   created_at: string;
 }
 
@@ -104,15 +128,143 @@ const LOCAL_STORAGE_CAMPAIGN_KEY = 'ais_job_outreach_campaign';
 const LOCAL_STORAGE_EVENTS_KEY = 'ais_job_outreach_campaign_events';
 const LOCAL_STORAGE_QUEUE_KEY = 'ais_job_outreach_campaign_queue';
 
+// Lock timeout: If leader tab does not pulse heartbeat within 12 seconds, another tab can assume leadership
+const RUNNER_HEARTBEAT_INTERVAL_MS = 4000;
+const RUNNER_LOCK_TIMEOUT_MS = 12000;
+
+function getStatusPriority(status: string): number {
+  switch (status) {
+    case 'sent':
+      return 5;
+    case 'processing':
+      return 4;
+    case 'email_generated':
+      return 3;
+    case 'pending':
+      return 2;
+    case 'failed':
+      return 1;
+    case 'skipped':
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function mergeAndPreserveQueuePriority(
+  currentItems: QueueItem[],
+  newItems: QueueItem[],
+  sentEmails: any[] = []
+): QueueItem[] {
+  const sentMap = new Map<string, any>();
+  const sentDomainMap = new Map<string, any>();
+  
+  sentEmails.forEach((record) => {
+    if (record) {
+      const emailVal = record.email || record.company_email || record.recipient || record.to;
+      if (emailVal) {
+        const emailNorm = emailVal.toLowerCase().trim();
+        sentMap.set(emailNorm, record);
+        
+        const domain = extractEmailDomain(emailNorm);
+        if (domain && !isGenericEmailDomain(domain)) {
+          sentDomainMap.set(domain, record);
+        }
+      }
+    }
+  });
+
+  const mergedMap = new Map<string, QueueItem>();
+
+  currentItems.forEach((item) => {
+    if (item && item.id) {
+      mergedMap.set(item.id, item);
+    }
+  });
+
+  newItems.forEach((newItem) => {
+    if (!newItem || !newItem.id) return;
+    
+    const existingItem = mergedMap.get(newItem.id);
+    let resolvedItem = { ...newItem };
+
+    if (existingItem) {
+      const currentPriority = getStatusPriority(existingItem.status);
+      const newPriority = getStatusPriority(newItem.status);
+      
+      if (currentPriority > newPriority) {
+        console.warn(`[AutoCampaign Dedup] Preserved higher priority status "${existingItem.status}" over "${newItem.status}" for ${newItem.company_name}`);
+        resolvedItem.status = existingItem.status;
+        if (existingItem.sent_at) resolvedItem.sent_at = existingItem.sent_at;
+        if (existingItem.gmail_message_id) resolvedItem.gmail_message_id = existingItem.gmail_message_id;
+        if (existingItem.gmail_thread_id) resolvedItem.gmail_thread_id = existingItem.gmail_thread_id;
+      }
+    }
+
+    if (resolvedItem.status !== 'sent') {
+      const emailNorm = resolvedItem.company_email.toLowerCase().trim();
+      const domain = extractEmailDomain(emailNorm);
+      
+      let matchedRecord = sentMap.get(emailNorm);
+      let matchType = 'email';
+      
+      if (!matchedRecord && domain && !isGenericEmailDomain(domain)) {
+        matchedRecord = sentDomainMap.get(domain);
+        matchType = 'domain';
+      }
+      
+      if (!matchedRecord) {
+        const companyTarget = {
+          id: resolvedItem.company_id || resolvedItem.id,
+          companyId: resolvedItem.company_id || resolvedItem.id,
+          name: resolvedItem.company_name,
+          company_name: resolvedItem.company_name,
+          email: resolvedItem.company_email,
+          website: resolvedItem.company_website,
+        };
+        
+        for (const record of sentEmails) {
+          const matchRes = isCompanyMatchSentRecord(companyTarget, record);
+          if (matchRes.isMatch) {
+            matchedRecord = record;
+            matchType = matchRes.matchType || 'name';
+            break;
+          }
+        }
+      }
+
+      if (matchedRecord) {
+        console.log(`[AutoCampaign Dedup] Automatic reconciliation for queue item "${resolvedItem.company_name}" -> "sent" due to match in sentEmails history (${matchType}).`);
+        resolvedItem.status = 'sent';
+        resolvedItem.sent_at = matchedRecord.sent_at || matchedRecord.sentAt || resolvedItem.sent_at || new Date().toISOString();
+        resolvedItem.gmail_message_id = matchedRecord.message_id || matchedRecord.messageId || resolvedItem.gmail_message_id || null;
+      }
+    }
+
+    mergedMap.set(newItem.id, resolvedItem);
+  });
+
+  return Array.from(mergedMap.values());
+}
+
 export function useAutoCampaign() {
   const { user } = useAuth();
   const { toast } = useToast();
   const { cvData, sintesiBreve, cvFileState, addLogInvio } = useCVContext();
-  const { profile } = useUserProfile();
+  const { profile, binary } = useUserProfile();
 
   const userId = requireUid(user?.id);
+  const sentEmailsHistoryRef = useRef<any[]>([]);
 
-  // Synchronous cache hydration
+  // Unique tab instance ID to prevent multi-tab split-brain / duplicate execution
+  const tabIdRef = useRef<string>(
+    typeof window !== 'undefined'
+      ? `tab_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`
+      : 'tab_server'
+  );
+  const tabId = tabIdRef.current;
+
+  // Local cache initialization
   const [campaign, setCampaign] = useState<Campaign | null>(() => {
     try {
       const stored = localStorage.getItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY));
@@ -120,9 +272,7 @@ export function useAutoCampaign() {
         const parsed = JSON.parse(stored);
         if (parsed && typeof parsed === 'object' && parsed.id) return parsed;
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
     return null;
   });
 
@@ -133,9 +283,7 @@ export function useAutoCampaign() {
         const parsed = JSON.parse(stored);
         if (Array.isArray(parsed)) return parsed;
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
     return [];
   });
 
@@ -146,187 +294,46 @@ export function useAutoCampaign() {
         const parsed = JSON.parse(stored);
         if (Array.isArray(parsed)) return parsed;
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
     return [];
   });
 
   const [pacingState, setPacingState] = useState<PacingState>(() => loadPacingState(userId));
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isLeader, setIsLeader] = useState<boolean>(false);
 
-  // Sync pacing state to storage whenever it updates
-  useEffect(() => {
-    savePacingState(pacingState, userId);
-  }, [pacingState, userId]);
-
-  const [isLoading, setIsLoading] = useState<boolean>(false);
   const isRunningStepRef = useRef<boolean>(false);
   const processorTriggerRef = useRef<number>(0);
+  const lastHeartbeatSentRef = useRef<number>(0);
 
-  // Helper to clear Gmail error and allow resume
-  const clearGmailError = useCallback(() => {
-    setPacingState((prev) => {
-      const updated: PacingState = {
-        ...prev,
-        gmailError: null,
-        pauseType: 'none',
-        pauseReason: null,
-        nextScheduledSendAt: 0,
-      };
-      savePacingState(updated, userId);
-      return updated;
-    });
-
-    if (campaign) {
-      updateCampaignState({
-        status: 'paused',
-        pause_reason: null,
-        gmail_error: null,
-        resume_at: null,
-      });
-    }
-
-    toast({
-      title: '✅ Errore Gmail azzerato',
-      description: 'Puoi ora riprendere la campagna con il pulsante "Riprendi".',
-    });
-  }, [campaign, userId, toast]);
-
-  // Helper to add an event
+  // Helper to add a live event (persisted both locally and to Firestore subcollection)
   const logEvent = useCallback((eventType: string, message: string, metadata?: any) => {
     const newEvt: CampaignEvent = {
       id: `evt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       campaign_id: campaign?.id || 'current',
       event_type: eventType,
       message,
-      metadata,
+      metadata: metadata || null,
       created_at: new Date().toISOString(),
     };
+
     setEvents((prev) => {
-      const updated = [newEvt, ...prev].slice(0, 100);
+      const updated = [newEvt, ...prev.filter(e => e.id !== newEvt.id)].slice(0, 100);
       try {
         localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_EVENTS_KEY), JSON.stringify(updated));
       } catch {}
       return updated;
     });
-  }, [campaign?.id]);
 
-  // Fetch active campaign & queue from server/Firestore with strict timeouts
-  const fetchCampaign = useCallback(async () => {
-    try {
-      // 1. Check Server first (fastest local endpoint)
+    if (userId) {
       try {
-        const ctrl = new AbortController();
-        const timeoutId = setTimeout(() => ctrl.abort(), 2000);
-        const res = await apiFetch('/api/campaigns', { signal: ctrl.signal });
-        clearTimeout(timeoutId);
-
-        if (res.ok) {
-          const json = await res.json();
-          if (json?.data) {
-            setCampaign(json.data);
-            try {
-              localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY), JSON.stringify(json.data));
-            } catch {}
-          }
-          if (Array.isArray(json?.events) && json.events.length > 0) {
-            setEvents(json.events);
-            try {
-              localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_EVENTS_KEY), JSON.stringify(json.events));
-            } catch {}
-          }
-        }
-      } catch (err) {
-        // server request failed or timed out, will try fallback
-      }
-
-      // 2. Check Queue from Server
-      try {
-        const ctrl = new AbortController();
-        const timeoutId = setTimeout(() => ctrl.abort(), 2000);
-        const qRes = await apiFetch('/api/campaign-queue', { signal: ctrl.signal });
-        clearTimeout(timeoutId);
-
-        if (qRes.ok) {
-          const qJson = await qRes.json();
-          if (Array.isArray(qJson?.data)) {
-            setQueueItems(qJson.data);
-            try {
-              localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY), JSON.stringify(qJson.data));
-            } catch {}
-          }
-        }
+        const evtDocRef = doc(db, 'users', userId, 'campaigns', 'current', 'events', newEvt.id);
+        setDoc(evtDocRef, sanitizeForFirestore(newEvt)).catch(() => {});
       } catch {}
-
-      // 3. Fallback to Firestore with 1000ms timeout race
-      try {
-        const campDocRef = doc(db, 'users', userId, 'campaigns', 'current');
-        const fetchPromise = getDoc(campDocRef).catch(() => null);
-        const timeoutPromise = new Promise<null>((res) => setTimeout(() => res(null), 1000));
-        const campSnap = await Promise.race([fetchPromise, timeoutPromise]);
-
-        if (campSnap && campSnap.exists()) {
-          const campData = campSnap.data() as Campaign;
-          setCampaign((prev) => prev || campData);
-          try {
-            localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY), JSON.stringify(campData));
-          } catch {}
-        }
-      } catch (e) {
-        console.warn('[AutoCampaign] Firestore read error:', e);
-      }
-    } finally {
-      setIsLoading(false);
     }
-  }, [userId]);
+  }, [campaign?.id, userId]);
 
-  // Initial load
-  useEffect(() => {
-    fetchCampaign();
-    // Safety watchdog: ensure loading is cleared after 1000ms max
-    const timer = setTimeout(() => setIsLoading(false), 1000);
-    return () => clearTimeout(timer);
-  }, [fetchCampaign]);
-
-  // Listen for external queue additions (from ManualCompanySearch or other tabs)
-  useEffect(() => {
-    const handleQueueUpdate = () => {
-      try {
-        const stored = localStorage.getItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY));
-        if (stored) {
-          const parsed = JSON.parse(stored);
-          if (Array.isArray(parsed)) setQueueItems(parsed);
-        }
-      } catch {}
-    };
-
-    window.addEventListener('campaign_queue_updated', handleQueueUpdate);
-    window.addEventListener('storage', handleQueueUpdate);
-    return () => {
-      window.removeEventListener('campaign_queue_updated', handleQueueUpdate);
-      window.removeEventListener('storage', handleQueueUpdate);
-    };
-  }, []);
-
-  // Update a queue item
-  const updateQueueItem = useCallback((id: string, updates: Partial<QueueItem>) => {
-    setQueueItems((prev) => {
-      const updated = prev.map((item) => (item.id === id ? { ...item, ...updates } : item));
-      try {
-        localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY), JSON.stringify(updated));
-      } catch {}
-      return updated;
-    });
-
-    // Sync with server
-    apiFetch(`/api/campaign-queue/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(updates),
-    }).catch(() => {});
-  }, []);
-
-  // Update campaign state helper
+  // Update campaign state helper (writes to Firestore Source of Truth and broadcasts)
   const updateCampaignState = useCallback((updates: Partial<Campaign>, eventMsg?: string) => {
     setCampaign((prev) => {
       if (!prev) return null;
@@ -341,100 +348,523 @@ export function useAutoCampaign() {
       return updated;
     });
 
-    // Sync with server
-    if (campaign?.id) {
-      apiFetch(`/api/campaigns/${campaign.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates),
-      }).catch(() => {});
+    // Write to Firestore single document authority
+    if (userId) {
+      try {
+        const campDocRef = doc(db, 'users', userId, 'campaigns', 'current');
+        const clean = sanitizeForFirestore({
+          ...updates,
+          updated_at: new Date().toISOString(),
+        });
+        setDoc(campDocRef, clean, { merge: true }).catch((err) => {
+          console.warn('[AutoCampaign] Firestore setDoc error:', err);
+        });
+      } catch (err) {
+        console.warn('[AutoCampaign] Firestore save error:', err);
+      }
     }
-
-    // Sync with Firestore (non-blocking)
-    try {
-      const campDocRef = doc(db, 'users', userId, 'campaigns', 'current');
-      setDoc(campDocRef, updates, { merge: true }).catch(() => {});
-    } catch {}
 
     if (eventMsg) {
       logEvent('info', eventMsg);
     }
-  }, [campaign?.id, userId, logEvent]);
+  }, [userId, logEvent]);
 
-  // Start campaign
-  const startCampaign = async (setup: CampaignSetupData) => {
+  // Helper to clear Gmail error and allow resume on all connected clients
+  const clearGmailError = useCallback(async () => {
     const today = getTodayDateString();
-    const effectiveDailyCount = pacingState.dailyDate === today ? pacingState.dailySentCount : 0;
+    const updatedPacing: PacingState = {
+      ...pacingState,
+      dailyDate: today,
+      gmailError: null,
+      pauseType: 'none',
+      pauseReason: null,
+      nextScheduledSendAt: 0,
+    };
 
-    const newCamp: Campaign = {
-      id: `camp_${Date.now()}`,
-      status: 'running',
-      search_location: setup.search_location,
-      search_radius: setup.search_radius,
-      search_keywords: setup.search_keywords,
-      only_selected_city: setup.only_selected_city,
-      target_total: setup.target_total || 50,
-      email_style: setup.email_style,
-      include_risky: setup.include_risky,
-      cv_file_path: setup.cv_file_path || null,
-      total_found: 0,
-      total_sent: 0,
-      total_failed: 0,
-      total_generated: 0,
-      total_skipped: 0,
-      current_search_cycle: 1,
-      max_search_cycles: setup.search_mode === 'swiss_painting' ? 20 : 5,
+    setPacingState(updatedPacing);
+    savePacingState(updatedPacing, userId);
+
+    if (userId) {
+      try {
+        const paceDocRef = doc(db, 'users', userId, 'pacing', 'current');
+        await setDoc(paceDocRef, sanitizeForFirestore(updatedPacing), { merge: true }).catch(() => {});
+      } catch {}
+    }
+
+    updateCampaignState({
+      status: 'paused',
       pause_reason: null,
+      gmail_error: null,
       resume_at: null,
-      started_at: new Date().toISOString(),
-      completed_at: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      daily_date: today,
-      daily_sent_count: effectiveDailyCount,
       active_pause_type: 'none',
-      hourly_sent_count: cleanHourlyTimestamps(pacingState.hourlySentTimestamps).length,
-    };
-
-    const newEvent: CampaignEvent = {
-      id: `evt_${Date.now()}`,
-      campaign_id: newCamp.id,
-      event_type: 'start',
-      message: `🚀 Auto Campaign avviata con Google Gemini per ${setup.search_location} (Pacing naturale antispam: max 50/giorno, max 8/h)`,
-      metadata: { setup },
-      created_at: new Date().toISOString(),
-    };
-
-    setCampaign(newCamp);
-    setEvents([newEvent]);
-    setQueueItems([]);
-
-    try {
-      localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY), JSON.stringify(newCamp));
-      localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_EVENTS_KEY), JSON.stringify([newEvent]));
-      localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY), JSON.stringify([]));
-    } catch {}
-
-    // Firestore sync
-    try {
-      const campDocRef = doc(db, 'users', userId, 'campaigns', 'current');
-      setDoc(campDocRef, newCamp).catch(() => {});
-    } catch {}
-
-    // Server sync
-    apiFetch('/api/campaigns', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newCamp),
-    }).catch(console.error);
-
-    toast({
-      title: '🚀 Auto Mode avviato!',
-      description: `Invio graduale attivato per ${setup.search_location} (max 50/giorno).`,
     });
 
-    // Trigger runner immediately
-    processorTriggerRef.current += 1;
+    logEvent('info', '🔓 Errore Gmail azzerato manualmente. La campagna è pronta per essere ripresa.');
+
+    toast({
+      title: '✅ Errore Gmail azzerato',
+      description: 'Puoi ora riprendere la campagna con il pulsante "Riprendi".',
+    });
+  }, [pacingState, userId, updateCampaignState, logEvent, toast]);
+
+  // Update a queue item in local state and Firestore subcollection
+  const updateQueueItem = useCallback((id: string, updates: Partial<QueueItem>) => {
+    let finalUpdates = { ...updates };
+
+    setQueueItems((prev) => {
+      const currentItem = prev.find((item) => item.id === id);
+      if (currentItem) {
+        if (updates.status && getStatusPriority(currentItem.status) > getStatusPriority(updates.status)) {
+          console.warn(`[AutoCampaign] Prevented status demotion for item ${currentItem.company_name} from "${currentItem.status}" to "${updates.status}".`);
+          const { status, ...rest } = updates;
+          finalUpdates = rest;
+        }
+      }
+
+      const updated = prev.map((item) => (item.id === id ? { ...item, ...finalUpdates } : item));
+      try {
+        localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY), JSON.stringify(updated));
+      } catch {}
+      return updated;
+    });
+
+    if (userId && Object.keys(finalUpdates).length > 0) {
+      try {
+        const qDocRef = doc(db, 'users', userId, 'campaigns', 'current', 'queue', id);
+        setDoc(qDocRef, sanitizeForFirestore(finalUpdates), { merge: true }).catch(() => {});
+      } catch {}
+    }
+  }, [userId]);
+
+  // Helper to normalize raw Firestore data into a valid, safe Campaign object
+  const normalizeCampaignData = useCallback((data: any, fallbackId = 'current'): Campaign | null => {
+    if (!data || typeof data !== 'object') return null;
+    // If it was explicitly reset (empty reset doc with no location and no start time)
+    if (data.status === 'stopped' && data.reset_at && !data.search_location && !data.started_at) {
+      return null;
+    }
+    // If document exists with fields, construct a fully validated Campaign record
+    const id = data.id || data.campaign_id || fallbackId || `camp_${Date.now()}`;
+    const status = (['running', 'paused', 'completed', 'stopped', 'idle', 'error'].includes(data.status)
+      ? data.status
+      : (data.status || 'running')) as string;
+
+    return {
+      id,
+      status,
+      search_location: data.search_location || 'Ticino',
+      search_radius: typeof data.search_radius === 'number' ? data.search_radius : 30,
+      search_keywords: Array.isArray(data.search_keywords) ? data.search_keywords : [],
+      only_selected_city: !!data.only_selected_city,
+      target_total: typeof data.target_total === 'number' ? data.target_total : 50,
+      email_style: data.email_style || 'standard',
+      include_risky: !!data.include_risky,
+      cv_file_path: data.cv_file_path || null,
+      total_found: typeof data.total_found === 'number' ? data.total_found : 0,
+      total_sent: typeof data.total_sent === 'number' ? data.total_sent : 0,
+      total_failed: typeof data.total_failed === 'number' ? data.total_failed : 0,
+      total_generated: typeof data.total_generated === 'number' ? data.total_generated : 0,
+      total_skipped: typeof data.total_skipped === 'number' ? data.total_skipped : 0,
+      current_search_cycle: typeof data.current_search_cycle === 'number' ? data.current_search_cycle : 1,
+      max_search_cycles: typeof data.max_search_cycles === 'number' ? data.max_search_cycles : 5,
+      pause_reason: data.pause_reason || null,
+      resume_at: data.resume_at || null,
+      next_send_at: data.next_send_at || null,
+      started_at: data.started_at || null,
+      completed_at: data.completed_at || null,
+      created_at: data.created_at || new Date().toISOString(),
+      updated_at: data.updated_at || new Date().toISOString(),
+      daily_date: data.daily_date || undefined,
+      daily_sent_count: typeof data.daily_sent_count === 'number' ? data.daily_sent_count : undefined,
+      gmail_error: data.gmail_error !== undefined ? data.gmail_error : null,
+      active_pause_type: data.active_pause_type || 'none',
+      hourly_sent_count: typeof data.hourly_sent_count === 'number' ? data.hourly_sent_count : undefined,
+      runner_lock: data.runner_lock || null,
+    };
+  }, []);
+
+  // =========================================================================
+  // REAL-TIME FIRESTORE SYNCHRONIZATION: Subscriptions to single Cloud Source of Truth
+  // =========================================================================
+  useEffect(() => {
+    if (!userId) {
+      setIsLoading(false);
+      return;
+    }
+
+    // 1. Subscribe to current campaign document (Cloud Source of Truth)
+    const campDocRef = doc(db, 'users', userId, 'campaigns', 'current');
+    const unsubCamp = onSnapshot(
+      campDocRef,
+      (snap) => {
+        setIsLoading(false);
+        if (snap.exists()) {
+          const rawData = snap.data();
+          const remoteCamp = normalizeCampaignData(rawData, snap.id);
+          if (remoteCamp) {
+            setCampaign(remoteCamp);
+            try {
+              localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY), JSON.stringify(remoteCamp));
+            } catch {}
+
+            // Check leader lock
+            const lock = remoteCamp.runner_lock;
+            const now = Date.now();
+            const lockIsHeldByMe = lock?.tab_id === tabId;
+            const lockIsFresh = lock && (now - (lock.heartbeat_at || 0) < RUNNER_LOCK_TIMEOUT_MS);
+
+            if (lockIsHeldByMe) {
+              setIsLeader(true);
+            } else if (!lockIsFresh) {
+              // Lock is stale or unheld; if campaign is running, we can contest leadership
+              setIsLeader(false);
+            } else {
+              // Another tab is actively leading
+              setIsLeader(false);
+            }
+
+            // Sync pacing state if present in campaign document
+            if (remoteCamp.daily_date || remoteCamp.daily_sent_count !== undefined) {
+              setPacingState((prev) => {
+                const updated: PacingState = {
+                  ...prev,
+                  dailyDate: remoteCamp.daily_date || prev.dailyDate,
+                  dailySentCount: typeof remoteCamp.daily_sent_count === 'number' ? remoteCamp.daily_sent_count : prev.dailySentCount,
+                  gmailError: remoteCamp.gmail_error !== undefined ? remoteCamp.gmail_error : prev.gmailError,
+                  pauseType: remoteCamp.active_pause_type || prev.pauseType,
+                  pauseReason: remoteCamp.pause_reason || prev.pauseReason,
+                  nextScheduledSendAt: remoteCamp.resume_at ? new Date(remoteCamp.resume_at).getTime() : prev.nextScheduledSendAt,
+                };
+                return updated;
+              });
+            }
+          } else {
+            // Document exists but was explicitly reset
+            setCampaign(null);
+            try {
+              localStorage.removeItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY));
+            } catch {}
+          }
+        } else {
+          // Document does not exist in Firestore Cloud
+          setCampaign(null);
+          try {
+            localStorage.removeItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY));
+          } catch {}
+        }
+      },
+      (err) => {
+        console.warn('[AutoCampaign] Realtime campaign snapshot warning:', err);
+        setIsLoading(false);
+      }
+    );
+
+    // 2. Subscribe to queue subcollection
+    const queueColRef = collection(db, 'users', userId, 'campaigns', 'current', 'queue');
+    const unsubQueue = onSnapshot(
+      queueColRef,
+      (qSnap) => {
+        if (!qSnap.empty) {
+          const fsItems: QueueItem[] = [];
+          qSnap.forEach((d) => {
+            const itm = d.data() as QueueItem;
+            if (itm && itm.id) fsItems.push(itm);
+          });
+          if (fsItems.length > 0) {
+            setQueueItems((prev) => {
+              const updated = mergeAndPreserveQueuePriority(prev, fsItems, sentEmailsHistoryRef.current);
+              try {
+                localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY), JSON.stringify(updated));
+              } catch {}
+              return updated;
+            });
+          }
+        }
+      },
+      (err) => {
+        console.warn('[AutoCampaign] Realtime queue snapshot warning:', err);
+      }
+    );
+
+    // 3. Subscribe to events subcollection
+    const eventsColRef = collection(db, 'users', userId, 'campaigns', 'current', 'events');
+    const eventsQuery = query(eventsColRef, orderBy('created_at', 'desc'), limit(60));
+    const unsubEvents = onSnapshot(
+      eventsQuery,
+      (eSnap) => {
+        if (!eSnap.empty) {
+          const fsEvents: CampaignEvent[] = [];
+          eSnap.forEach((d) => {
+            const ev = d.data() as CampaignEvent;
+            if (ev && ev.id) fsEvents.push(ev);
+          });
+          if (fsEvents.length > 0) {
+            setEvents(fsEvents);
+            try {
+              localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_EVENTS_KEY), JSON.stringify(fsEvents));
+            } catch {}
+          }
+        }
+      },
+      (err) => {
+        console.warn('[AutoCampaign] Realtime events snapshot warning:', err);
+      }
+    );
+
+    // 4. Subscribe to pacing document
+    const paceDocRef = doc(db, 'users', userId, 'pacing', 'current');
+    const unsubPacing = onSnapshot(
+      paceDocRef,
+      (pSnap) => {
+        if (pSnap.exists()) {
+          const pData = pSnap.data() as PacingState;
+          if (pData && typeof pData === 'object') {
+            const today = getTodayDateString();
+            const normalized: PacingState = {
+              dailyDate: pData.dailyDate || today,
+              dailySentCount: typeof pData.dailySentCount === 'number' ? pData.dailySentCount : 0,
+              hourlySentTimestamps: cleanHourlyTimestamps(pData.hourlySentTimestamps || []),
+              currentBlockSends: typeof pData.currentBlockSends === 'number' ? pData.currentBlockSends : 0,
+              currentBlockTarget: typeof pData.currentBlockTarget === 'number' ? pData.currentBlockTarget : getRandomBlockTarget(),
+              nextScheduledSendAt: pData.nextScheduledSendAt || null,
+              pauseType: pData.pauseType || 'none',
+              pauseReason: pData.pauseReason || null,
+              gmailError: pData.gmailError || null,
+              lastSentAt: pData.lastSentAt || null,
+            };
+            setPacingState(normalized);
+            savePacingState(normalized, userId);
+          }
+        }
+      },
+      (err) => {
+        console.warn('[AutoCampaign] Realtime pacing snapshot warning:', err);
+      }
+    );
+
+    return () => {
+      unsubCamp();
+      unsubQueue();
+      unsubEvents();
+      unsubPacing();
+    };
+  }, [userId, tabId, normalizeCampaignData]);
+
+  // Fetch & reconcile campaign on initial load
+  const fetchCampaign = useCallback(async () => {
+    if (!userId) {
+      setIsLoading(false);
+      return;
+    }
+
+    try {
+      let loadedCampaign: Campaign | null = null;
+      let loadedQueue: QueueItem[] = [];
+
+      // Read Firestore Campaign
+      const campDocRef = doc(db, 'users', userId, 'campaigns', 'current');
+      const campSnap = await getDoc(campDocRef).catch(() => null);
+
+      if (campSnap && campSnap.exists()) {
+        const rawData = campSnap.data();
+        const norm = normalizeCampaignData(rawData, campSnap.id);
+        if (norm) {
+          loadedCampaign = norm;
+          setCampaign((prev) => {
+            if (!prev) return loadedCampaign;
+            return {
+              ...prev,
+              ...loadedCampaign,
+              total_sent: Math.max(prev.total_sent || 0, loadedCampaign?.total_sent || 0),
+              daily_sent_count: Math.max(prev.daily_sent_count || 0, loadedCampaign?.daily_sent_count || 0),
+            };
+          });
+        }
+      }
+
+      // Read Firestore Queue
+      const qSnap = await getDocs(collection(db, 'users', userId, 'campaigns', 'current', 'queue')).catch(() => null);
+      if (qSnap && !qSnap.empty) {
+        loadedQueue = qSnap.docs.map((d) => d.data() as QueueItem);
+      }
+
+      // Reconcile with Sent Emails History (Source of Truth)
+      try {
+        const sentEmails = await fetchFirestoreSentEmailsHistory(userId, { timeoutMs: 8000 });
+        if (Array.isArray(sentEmails)) {
+          sentEmailsHistoryRef.current = sentEmails;
+          
+          const today = getTodayDateString();
+          const todaySentCount = sentEmails.filter((e) => {
+            const d = e.sent_at || (e as any).sentAt;
+            return d && d.startsWith(today);
+          }).length;
+
+          // Reconcile queue items safely preserving state priorities
+          loadedQueue = mergeAndPreserveQueuePriority(queueItems, loadedQueue, sentEmails);
+
+          // Reconcile campaign counters if discrepancy exists
+          if (loadedCampaign) {
+            const actualSent = Math.max(loadedCampaign.total_sent || 0, sentEmails.length);
+            const actualDaily = Math.max(loadedCampaign.daily_sent_count || 0, todaySentCount);
+            if (actualSent !== loadedCampaign.total_sent || actualDaily !== loadedCampaign.daily_sent_count) {
+              console.log(`[AutoCampaign] Reconciling campaign counters from ${loadedCampaign.total_sent} to ${actualSent} total sent.`);
+              loadedCampaign = {
+                ...loadedCampaign,
+                total_sent: actualSent,
+                daily_sent_count: actualDaily,
+                daily_date: today,
+              };
+              setCampaign(loadedCampaign);
+              setDoc(campDocRef, sanitizeForFirestore(loadedCampaign), { merge: true }).catch(() => {});
+            }
+          }
+        }
+      } catch (recErr) {
+        console.warn('[AutoCampaign] Reconciliation error:', recErr);
+      }
+
+      if (loadedQueue.length > 0) {
+        setQueueItems(loadedQueue);
+      }
+    } catch (e) {
+      console.warn('[AutoCampaign] Initial fetch error:', e);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [userId, normalizeCampaignData]);
+
+  useEffect(() => {
+    fetchCampaign();
+  }, [fetchCampaign]);
+
+  // =========================================================================
+  // USER ACTIONS: Single Campaign Control (Shared between Preview and Production)
+  // =========================================================================
+
+  // Start campaign: Checks if active campaign exists to prevent duplicate split-brain
+  const startCampaign = async (setup: CampaignSetupData) => {
+    if (!userId) return;
+    setIsLoading(true);
+
+    try {
+      const today = getTodayDateString();
+      const campDocRef = doc(db, 'users', userId, 'campaigns', 'current');
+      const existingSnap = await getDoc(campDocRef).catch(() => null);
+      const existingData = existingSnap?.exists() ? (existingSnap.data() as Campaign) : null;
+
+      // 1. RE-ATTACH GUARD: If a campaign is already running or paused, connect to it!
+      if (existingData && existingData.id && ['running', 'paused'].includes(existingData.status)) {
+        console.log('[AutoCampaign] Re-attaching to existing active cloud campaign:', existingData.id);
+
+        const attachedCamp: Campaign = {
+          ...existingData,
+          status: 'running',
+          runner_lock: {
+            tab_id: tabId,
+            heartbeat_at: Date.now(),
+            claimed_at: new Date().toISOString(),
+            origin: typeof window !== 'undefined' ? window.location.hostname : undefined,
+          },
+          updated_at: new Date().toISOString(),
+        };
+
+        await setDoc(campDocRef, sanitizeForFirestore(attachedCamp), { merge: true });
+        setCampaign(attachedCamp);
+        setIsLeader(true);
+
+        logEvent('resume', `🔄 Ricollegato alla campagna attiva in Cloud (${attachedCamp.total_sent}/${attachedCamp.target_total} inviate)`);
+
+        toast({
+          title: '🔄 Ricollegato alla Campagna Attiva',
+          description: `Agganciato alla campagna esistente (${attachedCamp.total_sent}/${attachedCamp.target_total} inviate).`,
+        });
+
+        processorTriggerRef.current += 1;
+        setIsLoading(false);
+        return;
+      }
+
+      // 2. CREATE NEW CAMPAIGN: Fresh single authoritative campaign
+      const effectiveDailyCount = pacingState.dailyDate === today ? pacingState.dailySentCount : 0;
+
+      const newCamp: Campaign = {
+        id: `camp_${Date.now()}`,
+        status: 'running',
+        search_location: setup.search_location,
+        search_radius: setup.search_radius,
+        search_keywords: setup.search_keywords,
+        only_selected_city: setup.only_selected_city,
+        target_total: setup.target_total || 50,
+        email_style: setup.email_style,
+        include_risky: setup.include_risky,
+        cv_file_path: setup.cv_file_path || null,
+        total_found: 0,
+        total_sent: 0,
+        total_failed: 0,
+        total_generated: 0,
+        total_skipped: 0,
+        current_search_cycle: 1,
+        max_search_cycles: setup.search_mode === 'swiss_painting' ? 20 : 5,
+        pause_reason: null,
+        resume_at: null,
+        started_at: new Date().toISOString(),
+        completed_at: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        daily_date: today,
+        daily_sent_count: effectiveDailyCount,
+        active_pause_type: 'none',
+        hourly_sent_count: cleanHourlyTimestamps(pacingState.hourlySentTimestamps).length,
+        runner_lock: {
+          tab_id: tabId,
+          heartbeat_at: Date.now(),
+          claimed_at: new Date().toISOString(),
+          origin: typeof window !== 'undefined' ? window.location.hostname : undefined,
+        },
+      };
+
+      const newEvent: CampaignEvent = {
+        id: `evt_${Date.now()}`,
+        campaign_id: newCamp.id,
+        event_type: 'start',
+        message: `🚀 Auto Campaign avviata per ${setup.search_location} (Pacing naturale antispam: max 50/giorno, max 8/h)`,
+        metadata: { setup },
+        created_at: new Date().toISOString(),
+      };
+
+      setCampaign(newCamp);
+      setEvents([newEvent]);
+      setQueueItems([]);
+      setIsLeader(true);
+
+      try {
+        localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY), JSON.stringify(newCamp));
+        localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_EVENTS_KEY), JSON.stringify([newEvent]));
+        localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY), JSON.stringify([]));
+      } catch {}
+
+      // Write new campaign & event to Firestore
+      await setDoc(campDocRef, sanitizeForFirestore(newCamp));
+      const evtDocRef = doc(db, 'users', userId, 'campaigns', 'current', 'events', newEvent.id);
+      setDoc(evtDocRef, sanitizeForFirestore(newEvent)).catch(() => {});
+
+      toast({
+        title: '🚀 Auto Mode avviato!',
+        description: `Invio graduale attivato per ${setup.search_location} (max 50/giorno).`,
+      });
+
+      processorTriggerRef.current += 1;
+    } catch (err: any) {
+      console.error('[AutoCampaign] startCampaign error:', err);
+      toast({
+        title: 'Errore avvio',
+        description: err.message || 'Impossibile avviare la campagna.',
+        variant: 'destructive',
+      });
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const pauseCampaign = async () => {
@@ -448,7 +878,7 @@ export function useAutoCampaign() {
     if (!campaign) return;
 
     // Check if stopped due to fatal Gmail error
-    if (pacingState.gmailError) {
+    if (pacingState.gmailError || campaign.gmail_error) {
       toast({
         title: '⚠️ Errore Gmail attivo',
         description: 'Riconnetti l\'account Gmail o clicca "Azzera Errore" prima di riprendere la campagna.',
@@ -467,7 +897,19 @@ export function useAutoCampaign() {
       return;
     }
 
-    updateCampaignState({ status: 'running', pause_reason: null });
+    // Claim leadership and set status to running
+    updateCampaignState({
+      status: 'running',
+      pause_reason: null,
+      runner_lock: {
+        tab_id: tabId,
+        heartbeat_at: Date.now(),
+        claimed_at: new Date().toISOString(),
+        origin: typeof window !== 'undefined' ? window.location.hostname : undefined,
+      },
+    });
+
+    setIsLeader(true);
     logEvent('resume', '▶️ Auto Mode ripreso');
     toast({ title: '▶️ Auto Mode ripreso!' });
     processorTriggerRef.current += 1;
@@ -475,7 +917,12 @@ export function useAutoCampaign() {
 
   const stopCampaign = async () => {
     if (!campaign) return;
-    updateCampaignState({ status: 'stopped', completed_at: new Date().toISOString() });
+    updateCampaignState({
+      status: 'stopped',
+      completed_at: new Date().toISOString(),
+      runner_lock: null,
+    });
+    setIsLeader(false);
     logEvent('stop', '⏹️ Campagna terminata definitivamente');
     toast({ title: '⏹️ Campagna fermata' });
   };
@@ -484,18 +931,53 @@ export function useAutoCampaign() {
     setCampaign(null);
     setEvents([]);
     setQueueItems([]);
+    setIsLeader(false);
+
     try {
       localStorage.removeItem(scopedStorageKey(LOCAL_STORAGE_CAMPAIGN_KEY));
       localStorage.removeItem(scopedStorageKey(LOCAL_STORAGE_EVENTS_KEY));
       localStorage.removeItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY));
     } catch {}
 
-    apiFetch('/api/campaigns', { method: 'DELETE' }).catch(() => {});
+    if (userId) {
+      try {
+        // 1. Svuota la subcollection "queue" in Firestore (Senza toccare sentEmails)
+        const queueColRef = collection(db, 'users', userId, 'campaigns', 'current', 'queue');
+        const queueSnap = await getDocs(queueColRef).catch(() => null);
+        if (queueSnap && !queueSnap.empty) {
+          const deleteQueuePromises = queueSnap.docs.map((docSnap) => deleteDoc(docSnap.ref));
+          await Promise.all(deleteQueuePromises).catch((err) => {
+            console.error('[resetCampaign] Errore durante lo svuotamento della coda:', err);
+          });
+        }
 
-    try {
-      const campDocRef = doc(db, 'users', userId, 'campaigns', 'current');
-      setDoc(campDocRef, { status: 'stopped', reset_at: new Date().toISOString() }).catch(() => {});
-    } catch {}
+        // 2. Svuota la subcollection "events" in Firestore
+        const eventsColRef = collection(db, 'users', userId, 'campaigns', 'current', 'events');
+        const eventsSnap = await getDocs(eventsColRef).catch(() => null);
+        if (eventsSnap && !eventsSnap.empty) {
+          const deleteEventsPromises = eventsSnap.docs.map((docSnap) => deleteDoc(docSnap.ref));
+          await Promise.all(deleteEventsPromises).catch((err) => {
+            console.error('[resetCampaign] Errore durante lo svuotamento degli eventi:', err);
+          });
+        }
+
+        // 3. Elimina o resetta il documento della campagna "current"
+        const campDocRef = doc(db, 'users', userId, 'campaigns', 'current');
+        await deleteDoc(campDocRef).catch(async () => {
+          await setDoc(campDocRef, {
+            status: 'stopped',
+            reset_at: new Date().toISOString(),
+            search_location: '',
+            started_at: null,
+            total_sent: 0,
+            total_found: 0,
+            runner_lock: null,
+          });
+        });
+      } catch (err) {
+        console.warn('[resetCampaign] Errore di connessione Firestore:', err);
+      }
+    }
 
     toast({ title: 'Campagna azzerata', description: 'Pronto per impostare una nuova campagna.' });
   };
@@ -509,7 +991,7 @@ export function useAutoCampaign() {
   }, [toast]);
 
   // =========================================================================
-  // CORE ENGINE: Auto Search & Send Loop with Strict Anti-Spam Pacing
+  // CORE ENGINE: Auto Search & Send Loop with Distributed Leader Lock
   // =========================================================================
   useEffect(() => {
     if (!campaign || campaign.status !== 'running') {
@@ -523,13 +1005,60 @@ export function useAutoCampaign() {
       isRunningStepRef.current = true;
 
       try {
+        const now = Date.now();
+
         // -------------------------------------------------------------------
-        // 0. CHECK STRICT PACING RULES BEFORE ANY SEND ACTION
+        // 1. LEADER ELECTION & RUNNER LOCK CHECK
         // -------------------------------------------------------------------
-        const canSend = checkCanSendNow(pacingState);
+        const lock = campaign.runner_lock;
+        const lockIsHeldByMe = lock?.tab_id === tabId;
+        const lockIsStale = !lock || (now - (lock.heartbeat_at || 0) > RUNNER_LOCK_TIMEOUT_MS);
+
+        if (!lockIsHeldByMe && !lockIsStale) {
+          // Another tab is actively executing the runner. We are in observer/controller mode.
+          if (isLeader) setIsLeader(false);
+          return;
+        }
+
+        // Claim or refresh leadership lock
+        if (!lockIsHeldByMe && lockIsStale) {
+          console.log('[AutoCampaign] Claiming leader lock for tab:', tabId);
+          setIsLeader(true);
+          updateCampaignState({
+            runner_lock: {
+              tab_id: tabId,
+              heartbeat_at: now,
+              claimed_at: new Date().toISOString(),
+              origin: typeof window !== 'undefined' ? window.location.hostname : undefined,
+            },
+          });
+        } else if (lockIsHeldByMe && now - lastHeartbeatSentRef.current > RUNNER_HEARTBEAT_INTERVAL_MS) {
+          // Pulse heartbeat
+          lastHeartbeatSentRef.current = now;
+          if (userId) {
+            const campDocRef = doc(db, 'users', userId, 'campaigns', 'current');
+            setDoc(
+              campDocRef,
+              {
+                runner_lock: {
+                  tab_id: tabId,
+                  heartbeat_at: now,
+                  origin: typeof window !== 'undefined' ? window.location.hostname : undefined,
+                },
+                updated_at: new Date().toISOString(),
+              },
+              { merge: true }
+            ).catch(() => {});
+          }
+        }
+
+        // -------------------------------------------------------------------
+        // 2. CHECK STRICT PACING RULES BEFORE ANY SEND ACTION
+        // -------------------------------------------------------------------
+        const canSend = checkCanSendNow(pacingState, now);
 
         if (!canSend.allowed) {
-          // If Gmail fatal error, stop immediately!
+          // Fatal Gmail error -> Pause immediately
           if (canSend.pauseType === 'gmail_error') {
             updateCampaignState({
               status: 'paused',
@@ -539,14 +1068,15 @@ export function useAutoCampaign() {
             return;
           }
 
-          // If daily limit reached (50/50), pause until tomorrow
+          // Daily limit 50/50 reached -> Pause until tomorrow
           if (canSend.pauseType === 'daily_limit') {
-            const nextDayDate = canSend.waitMs ? new Date(Date.now() + canSend.waitMs).toISOString() : null;
+            const nextDayDate = canSend.waitMs ? new Date(now + canSend.waitMs).toISOString() : null;
             if (campaign.pause_reason !== canSend.reason) {
               updateCampaignState({
                 status: 'paused',
                 pause_reason: canSend.reason || 'Limite giornaliero di 50 candidature raggiunto. Invii sospesi fino a domani.',
                 resume_at: nextDayDate,
+                active_pause_type: 'daily_limit',
               });
               logEvent(
                 'daily_limit',
@@ -556,8 +1086,8 @@ export function useAutoCampaign() {
             return;
           }
 
-          // If in natural interval (6-12m), block pause (20-40m), hourly limit (8/h), or temp error (30m)
-          const resumeIso = canSend.waitMs ? new Date(Date.now() + canSend.waitMs).toISOString() : null;
+          // Natural interval (6-12m) or block pause (20-40m)
+          const resumeIso = canSend.waitMs ? new Date(now + canSend.waitMs).toISOString() : null;
           if (campaign.pause_reason !== canSend.reason || campaign.resume_at !== resumeIso) {
             updateCampaignState({
               pause_reason: canSend.reason || null,
@@ -565,17 +1095,16 @@ export function useAutoCampaign() {
               active_pause_type: canSend.pauseType,
             });
           }
-          // Strict rule: do not proceed to send until interval/pause completes!
           return;
         }
 
-        // Check if queue has pending or generated items
+        // Check queue items
         const pendingOrGenerated = queueItems.filter(
           (q) => q.status === 'pending' || q.status === 'email_generated'
         );
 
         // -------------------------------------------------------------------
-        // 1. AUTO SEARCH PHASE: If queue has no items, search for new targets
+        // 3. AUTO SEARCH PHASE: Search for new companies if queue empty
         // -------------------------------------------------------------------
         if (
           pendingOrGenerated.length === 0 &&
@@ -587,151 +1116,371 @@ export function useAutoCampaign() {
             `🔍 Ricerca aziende con Google Gemini per ${campaign.search_location} (Ciclo ${campaign.current_search_cycle}/${campaign.max_search_cycles})...`
           );
 
-          let currentBlacklist: BlacklistEntry[] = [];
           try {
-            const rawBl = localStorage.getItem(scopedStorageKey(STORAGE_KEY_BLACKLIST));
-            if (rawBl) currentBlacklist = JSON.parse(rawBl);
-          } catch {}
+            const currentBlacklist: BlacklistEntry[] = await fetchFirestoreBlacklist(userId);
 
-          const searchResult = await aiAgent.searchCompanies(
-            campaign.search_location || 'Lugano, Canton Ticino',
-            campaign.search_radius || 30,
-            campaign.search_keywords || ['produzione', 'verniciatura', 'metalmeccanica'],
-            cvData?.competenze,
-            cvData?.profilo,
-            25,
-            cvData?.citta || campaign.search_location,
-            campaign.only_selected_city
-          );
+            const searchResult = await aiAgent.searchCompanies(
+              campaign.search_location || 'Lugano, Canton Ticino',
+              campaign.search_radius || 30,
+              campaign.search_keywords || ['produzione', 'verniciatura', 'metalmeccanica'],
+              cvData?.competenze,
+              cvData?.profilo,
+              25,
+              cvData?.citta || campaign.search_location,
+              campaign.only_selected_city,
+              campaign.current_search_cycle
+            );
 
-          if (!isMounted) return;
+            if (!isMounted) return;
 
-          if (searchResult.success && Array.isArray(searchResult.data) && searchResult.data.length > 0) {
-            const existingEmails = new Set(queueItems.map((q) => q.company_email.toLowerCase()));
+            if (searchResult.success && Array.isArray(searchResult.data) && searchResult.data.length > 0) {
+              // Get live sent history directly from Firestore (primary source of truth)
+              const sentHistory = await fetchFirestoreSentEmailsHistory(userId, { timeoutMs: 5000 });
 
-            const newValidItems: QueueItem[] = [];
-            for (const c of searchResult.data) {
-              if (!c.email) continue;
-              const em = c.email.trim().toLowerCase();
-              if (existingEmails.has(em)) continue;
+              // Fetch live queue directly from Firestore to avoid local-state race conditions or delays
+              const qSnapDirect = await getDocs(collection(db, 'users', userId, 'campaigns', 'current', 'queue')).catch(() => null);
+              const liveQueueItems = qSnapDirect && !qSnapDirect.empty
+                ? qSnapDirect.docs.map((d) => d.data() as QueueItem)
+                : [];
 
-              // Check blacklist
-              const blCheck = isEmailBlacklisted(em, currentBlacklist);
-              if (blCheck.isBlacklisted) continue;
-
-              // Check sent duplicate
-              const dupCheck = await aiAgent.checkDuplicate(em, c.name, true);
-              if (dupCheck.isDuplicate) continue;
-
-              existingEmails.add(em);
-              newValidItems.push({
-                id: `queue_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-                campaign_id: campaign.id,
-                user_id: userId,
-                company_name: c.name,
-                company_email: em,
-                company_city: c.city || null,
-                company_sector: c.sector || null,
-                company_website: c.website || null,
-                status: 'pending',
-                confidence_score: c.confidence_score || 85,
-                created_at: new Date().toISOString(),
-              });
-            }
-
-            if (newValidItems.length > 0) {
-              const updatedQueue = [...queueItems, ...newValidItems];
-              setQueueItems(updatedQueue);
-              try {
-                localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY), JSON.stringify(updatedQueue));
-              } catch {}
-
-              apiFetch('/api/campaign-queue', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(newValidItems),
-              }).catch(() => {});
-
-              updateCampaignState({
-                total_found: updatedQueue.length,
-                current_search_cycle: campaign.current_search_cycle + 1,
+              // Merge local queueItems with live queue items from Firestore for absolute completeness
+              const combinedQueue = [...queueItems];
+              liveQueueItems.forEach((itm) => {
+                if (itm && itm.id && !combinedQueue.some((q) => q.id === itm.id)) {
+                  combinedQueue.push(itm);
+                }
               });
 
+              // Tracking for this search cycle to avoid duplicating within the same batch
+              const currentCycleEmails = new Set<string>();
+              const currentCycleDomains = new Set<string>();
+
+              const newValidItems: QueueItem[] = [];
+
+              for (const c of searchResult.data) {
+                if (!c.email) continue;
+                const em = c.email.trim().toLowerCase();
+                const cDomain = extractEmailDomain(em);
+                const companyTarget = {
+                  id: (c as any).id || (c as any).companyId || (c as any).company_id || '',
+                  companyId: (c as any).id || (c as any).companyId || (c as any).company_id || '',
+                  name: c.name,
+                  company_name: c.name,
+                  email: em,
+                  company_email: em,
+                  domain: cDomain,
+                  website: c.website,
+                };
+
+                // 0. Include Risky check
+                const isRisky = c.final_status === 'risky_send' || (c as any).finalStatus === 'risky_send';
+                const foundRiskyAndExcluded = isRisky && !campaign.include_risky;
+
+                // 1. Sent History Check (Source of Truth)
+                let foundInSentEmails = false;
+                let sentEmailReason = '';
+                for (const record of sentHistory) {
+                  const matchRes = isCompanyMatchSentRecord(companyTarget, record);
+                  if (matchRes.isMatch) {
+                    foundInSentEmails = true;
+                    sentEmailReason = matchRes.detail || `Storico invio (${matchRes.matchType})`;
+                    break;
+                  }
+                }
+
+                // 2. Queue Check (Combined Queue)
+                let foundInQueue = false;
+                let queueReason = '';
+
+                for (const item of combinedQueue) {
+                  const allowedStates = ['sent', 'pending', 'processing', 'email_generated'];
+                  if (!allowedStates.includes(item.status)) continue;
+
+                  const qEmail = item.company_email.toLowerCase().trim();
+                  const qDomain = extractEmailDomain(qEmail);
+
+                  if (em === qEmail) {
+                    foundInQueue = true;
+                    queueReason = `Coda: stessa email (${em})`;
+                    break;
+                  }
+
+                  if (cDomain && !isGenericEmailDomain(cDomain) && qDomain && !isGenericEmailDomain(qDomain) && cDomain === qDomain) {
+                    foundInQueue = true;
+                    queueReason = `Coda: stesso dominio corporate (${cDomain})`;
+                    break;
+                  }
+
+                  const qCompanyId = normalizeCompanyId(item.company_id || item.id);
+                  const candCompanyIdNorm = normalizeCompanyId(companyTarget.companyId);
+                  if (candCompanyIdNorm && qCompanyId && candCompanyIdNorm === qCompanyId) {
+                    foundInQueue = true;
+                    queueReason = `Coda: stesso companyId (${candCompanyIdNorm})`;
+                    break;
+                  }
+                }
+
+                // Search cycle duplicate check
+                if (!foundInQueue) {
+                  if (currentCycleEmails.has(em)) {
+                    foundInQueue = true;
+                    queueReason = `Ciclo: email duplicata nel set di risultati`;
+                  } else if (cDomain && !isGenericEmailDomain(cDomain) && currentCycleDomains.has(cDomain)) {
+                    foundInQueue = true;
+                    queueReason = `Ciclo: dominio corporate duplicato nel set di risultati (${cDomain})`;
+                  }
+                }
+
+                // 3. Blacklist Check
+                const blacklistCheck = isEmailBlacklisted(em, currentBlacklist);
+                const foundInBlacklist = blacklistCheck.isBlacklisted;
+
+                const shouldSkip = foundInSentEmails || foundInQueue || foundInBlacklist || foundRiskyAndExcluded;
+                const decision = shouldSkip ? 'SKIP' : 'ADD';
+                
+                let skipReason = '';
+                if (foundRiskyAndExcluded) skipReason = 'Contatto "risky" escluso (opzione disattivata)';
+                else if (foundInSentEmails) skipReason = sentEmailReason;
+                else if (foundInQueue) skipReason = queueReason;
+                else if (foundInBlacklist) skipReason = blacklistCheck.reason || 'Blacklist';
+
+                // Exact debug log format requested by user
+                console.log(
+                  `[DEDUP SEARCH]\n` +
+                  `company: "${c.name}"\n` +
+                  `email: "${em}"\n` +
+                  `domain: "${cDomain || ''}"\n` +
+                  `isRisky: ${isRisky}\n` +
+                  `inSentEmails: ${foundInSentEmails}\n` +
+                  `inQueue: ${foundInQueue}\n` +
+                  `inBlacklist: ${foundInBlacklist}\n` +
+                  `decision: ${decision}\n` +
+                  `reason: ${shouldSkip ? skipReason : 'Nuova azienda idonea'}`
+                );
+
+                if (shouldSkip) continue;
+
+                currentCycleEmails.add(em);
+                if (cDomain && !isGenericEmailDomain(cDomain)) {
+                  currentCycleDomains.add(cDomain);
+                }
+
+                const newItem: QueueItem = {
+                  id: `queue_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                  campaign_id: campaign.id,
+                  user_id: userId,
+                  company_id: companyTarget.companyId || null,
+                  company_name: c.name,
+                  company_email: em,
+                  company_city: c.city || null,
+                  company_sector: c.sector || null,
+                  company_website: c.website || null,
+                  status: 'pending',
+                  confidence_score: c.confidence_score || 85,
+                  created_at: new Date().toISOString(),
+                };
+                newValidItems.push(newItem);
+
+                // Persist queue item directly to Firestore
+                if (userId) {
+                  const qDocRef = doc(db, 'users', userId, 'campaigns', 'current', 'queue', newItem.id);
+                  setDoc(qDocRef, sanitizeForFirestore(newItem)).catch(() => {});
+                }
+              }
+
+              const rawCount = searchResult.data.length;
+              const newCount = newValidItems.length;
+              const strategyUsed = searchResult.searchStats?.strategyUsed || campaign.search_keywords?.join(', ') || 'Generale';
+
+              // Distinct Live Console logs requested by user
               logEvent(
-                'search_completed',
-                `✅ Trovate ${newValidItems.length} nuove aziende verificate con email. Aggiunte alla coda.`
+                'search_success',
+                `[Ciclo ${campaign.current_search_cycle}/${campaign.max_search_cycles}] ${strategyUsed} → ${rawCount} risultati grezzi, ${newCount} nuovi`
               );
-              isRunningStepRef.current = false;
-              return;
+
+              if (newValidItems.length > 0) {
+                const updatedQueue = [...queueItems, ...newValidItems];
+                setQueueItems(updatedQueue);
+                try {
+                  localStorage.setItem(scopedStorageKey(LOCAL_STORAGE_QUEUE_KEY), JSON.stringify(updatedQueue));
+                } catch {}
+
+                const newFound = (campaign.total_found || 0) + newValidItems.length;
+                const nextCycle = campaign.current_search_cycle + 1;
+
+                updateCampaignState(
+                  {
+                    total_found: newFound,
+                    current_search_cycle: nextCycle,
+                  },
+                  `✅ Trovate ${newValidItems.length} nuove aziende idonee e non ancora contattate (Totale trovate: ${newFound})`
+                );
+              } else {
+                const nextCycle = campaign.current_search_cycle + 1;
+                if (nextCycle > campaign.max_search_cycles) {
+                  updateCampaignState(
+                    { current_search_cycle: nextCycle },
+                    `⚠️ Nessuna nuova azienda non contattata trovata nella zona selezionata dopo ${campaign.max_search_cycles} passate.`
+                  );
+                } else {
+                  updateCampaignState({ current_search_cycle: nextCycle });
+                }
+              }
             } else {
-              logEvent(
-                'search_empty',
-                `Nessuna nuova azienda non contattata trovata nel ciclo ${campaign.current_search_cycle}. Incremento ciclo.`
-              );
-              updateCampaignState({
-                current_search_cycle: campaign.current_search_cycle + 1,
-              });
+              const nextCycle = campaign.current_search_cycle + 1;
+              updateCampaignState({ current_search_cycle: nextCycle });
             }
-          } else {
+          } catch (err: any) {
+            console.error('[AutoCampaign Search Error]:', err);
+            const nextCycle = campaign.current_search_cycle + 1;
             logEvent(
               'search_error',
-              `⚠️ Ricerca non ha restituito aziende idonee. Riprovo nel prossimo ciclo.`
+              `⚠️ Errore temporaneo nel ciclo ${campaign.current_search_cycle}: ${err?.message || 'Connessione instabile o quota esaurita'}. Passaggio al ciclo successivo...`
             );
-            updateCampaignState({
-              current_search_cycle: campaign.current_search_cycle + 1,
-            });
+            updateCampaignState({ current_search_cycle: nextCycle });
           }
+          return;
         }
 
         // -------------------------------------------------------------------
-        // 2. AUTO CANDIDACY SEND PHASE
+        // 4. SEND PHASE: Send next queued email according to anti-spam pacing
         // -------------------------------------------------------------------
-        const nextItem = queueItems.find(
-          (q) => q.status === 'pending' || q.status === 'email_generated'
-        );
+        let nextItem: QueueItem | undefined = undefined;
+        for (const item of queueItems) {
+          if (item.status !== 'pending' && item.status !== 'email_generated') continue;
+
+          // 1. Blacklist check before sending
+          try {
+            const currentBlacklist = await fetchFirestoreBlacklist(userId);
+            const blacklistCheck = isEmailBlacklisted(item.company_email, currentBlacklist);
+            if (blacklistCheck.isBlacklisted) {
+              console.log(`[AutoCampaign Pre-Send] Item ${item.company_name} is blacklisted, skipping.`);
+              logEvent('skipped', `⚠️ Elemento ${item.company_name} saltato in fase di invio: presente in Blacklist.`);
+              updateQueueItem(item.id, { status: 'skipped', error_message: blacklistCheck.reason || 'Presente in Blacklist' });
+              continue;
+            }
+          } catch (blErr) {
+            console.warn('[AutoCampaign] Pre-send blacklist check warning:', blErr);
+          }
+
+          // 2. Sent history check before sending
+          let isAlreadySent = false;
+          let sentReason = '';
+          try {
+            const sentHistory = await fetchFirestoreSentEmailsHistory(userId, { timeoutMs: 5000 });
+            sentEmailsHistoryRef.current = sentHistory; // Keep ref updated
+
+            const companyTarget = {
+              id: item.company_id || item.id,
+              companyId: item.company_id || item.id,
+              name: item.company_name,
+              company_name: item.company_name,
+              email: item.company_email,
+              website: item.company_website,
+            };
+
+            for (const record of sentHistory) {
+              const matchRes = isCompanyMatchSentRecord(companyTarget, record);
+              if (matchRes.isMatch) {
+                isAlreadySent = true;
+                sentReason = matchRes.detail || `Storico invio (${matchRes.matchType})`;
+                break;
+              }
+            }
+          } catch (dupErr) {
+            console.warn('[AutoCampaign] Pre-send check warning:', dupErr);
+          }
+
+          if (isAlreadySent) {
+            console.log(`[AutoCampaign Pre-Send] Item ${item.company_name} already in Firestore history, skipping. Reason: ${sentReason}`);
+            logEvent('skipped', `⚠️ Elemento ${item.company_name} saltato in fase di invio: già contattato (${sentReason}).`);
+            updateQueueItem(item.id, { status: 'skipped', error_message: `Già contattato: ${sentReason}` });
+            continue;
+          }
+
+          // 3. Active queue duplicates check
+          let hasQueueDuplicate = false;
+          let queueDupReason = '';
+          const itemEmail = item.company_email.toLowerCase().trim();
+          const itemDomain = extractEmailDomain(itemEmail);
+          const itemCompanyId = normalizeCompanyId(item.company_id || item.id);
+
+          for (const other of queueItems) {
+            if (other.id === item.id) continue;
+            // A duplicate must have been processed or is processing ('sent' or 'processing')
+            if (other.status !== 'sent' && other.status !== 'processing') continue;
+
+            const otherEmail = other.company_email.toLowerCase().trim();
+            const otherDomain = extractEmailDomain(otherEmail);
+            const otherCompanyId = normalizeCompanyId(other.company_id || other.id);
+
+            if (itemEmail === otherEmail) {
+              hasQueueDuplicate = true;
+              queueDupReason = `Email identica (${itemEmail}) già in coda con stato "${other.status}"`;
+              break;
+            }
+
+            if (itemDomain && !isGenericEmailDomain(itemDomain) && otherDomain && !isGenericEmailDomain(otherDomain) && itemDomain === otherDomain) {
+              hasQueueDuplicate = true;
+              queueDupReason = `Dominio corporate identico (${itemDomain}) già in coda con stato "${other.status}"`;
+              break;
+            }
+
+            if (itemCompanyId && otherCompanyId && itemCompanyId === otherCompanyId) {
+              hasQueueDuplicate = true;
+              queueDupReason = `Company ID identico (${itemCompanyId}) già in coda con stato "${other.status}"`;
+              break;
+            }
+          }
+
+          if (hasQueueDuplicate) {
+            console.log(`[AutoCampaign Pre-Send] Item ${item.company_name} has active queue duplicate, skipping. Reason: ${queueDupReason}`);
+            logEvent('skipped', `⚠️ Elemento ${item.company_name} saltato in fase di invio: duplicato in coda (${queueDupReason}).`);
+            updateQueueItem(item.id, { status: 'skipped', error_message: `Duplicato in coda: ${queueDupReason}` });
+            continue;
+          }
+
+          nextItem = item;
+          break;
+        }
 
         if (nextItem && campaign.total_sent < campaign.target_total) {
-          // Rule: Check blacklist again before sending
-          let currentBlacklist: BlacklistEntry[] = [];
-          try {
-            const rawBl = localStorage.getItem(scopedStorageKey(STORAGE_KEY_BLACKLIST));
-            if (rawBl) currentBlacklist = JSON.parse(rawBl);
-          } catch {}
-
-          const blCheck = isEmailBlacklisted(nextItem.company_email, currentBlacklist);
-          if (blCheck.isBlacklisted) {
-            logEvent('email_skipped', `⚠️ Azienda ${nextItem.company_name} (${nextItem.company_email}) scartata: presente nella Blacklist`);
-            updateQueueItem(nextItem.id, { status: 'discarded', error_message: 'Blacklisted' });
-            updateCampaignState({ total_skipped: (campaign.total_skipped || 0) + 1 });
-            return;
-          }
-
-          // Rule: Check duplicate again
-          const dupCheck = await aiAgent.checkDuplicate(nextItem.company_email, nextItem.company_name, true);
-          if (dupCheck.isDuplicate) {
-            logEvent('email_skipped', `⚠️ Azienda ${nextItem.company_name} (${nextItem.company_email}) scartata: già contattata in precedenza`);
-            updateQueueItem(nextItem.id, { status: 'discarded', error_message: 'Già contattata' });
-            updateCampaignState({ total_skipped: (campaign.total_skipped || 0) + 1 });
-            return;
-          }
-
-          // Rule: Strict CV PDF attachment check
+          // Rule: Verify CV PDF attachment
           let attachment: { filename: string; mimeType: string; base64: string } | undefined;
           try {
-            const verifiedCv = await getVerifiedCvAttachment(cvFileState, cvData, profile);
+            const fileState = cvFileState?.base64Data ? cvFileState : (binary ? {
+              file: null, uid: binary.uid, fileName: binary.filename,
+              base64Data: binary.base64, mimeType: binary.mimeType, contentHash: binary.contentHash
+            } : cvFileState);
+            const verifiedCv = await getVerifiedCvAttachment(fileState, cvData, profile);
             if (verifiedCv.ok && verifiedCv.attachment?.base64 && verifiedCv.attachment.base64.length > 50) {
               attachment = {
-                filename: verifiedCv.attachment.filename || cvFileState?.fileName || 'Curriculum_Vitae.pdf',
-                mimeType: verifiedCv.attachment.mimeType || 'application/pdf',
+                filename: verifiedCv.attachment.filename || cvFileState?.fileName || binary?.filename || 'Curriculum_Vitae.pdf',
+                mimeType: verifiedCv.attachment.mimeType || cvFileState?.mimeType || binary?.mimeType || 'application/pdf',
                 base64: verifiedCv.attachment.base64,
               };
+            } else if (binary?.base64 && binary.base64.length > 50) {
+              attachment = {
+                filename: binary.filename || cvFileState?.fileName || 'Curriculum_Vitae.pdf',
+                mimeType: binary.mimeType || cvFileState?.mimeType || 'application/pdf',
+                base64: binary.base64,
+              };
+            } else {
+              const loadedBinary = await loadCvBinary(userId);
+              if (loadedBinary?.base64 && loadedBinary.base64.length > 50) {
+                attachment = {
+                  filename: loadedBinary.filename || 'Curriculum_Vitae.pdf',
+                  mimeType: loadedBinary.mimeType || 'application/pdf',
+                  base64: loadedBinary.base64,
+                };
+              }
             }
           } catch (cvErr) {
             console.warn('[AutoCampaign] Errore verifica CV attachment:', cvErr);
           }
 
           if (!attachment || !attachment.base64 || attachment.base64.length < 50) {
-            const errMsg = "Invio bloccato: nessun file CV in formato PDF valido rilevato. L'allegato CV è obbligatorio in Auto Mode.";
+            const errMsg = "Invio bloccato: nessun file CV in formato PDF valido rilevato.";
             logEvent('error', `❌ ${errMsg}`);
             updateQueueItem(nextItem.id, { status: 'failed', error_message: errMsg });
             updateCampaignState({
@@ -746,16 +1495,12 @@ export function useAutoCampaign() {
             return;
           }
 
-          logEvent(
-            'email_generating',
-            `📝 Generazione candidatura personalizzata per ${nextItem.company_name}...`
-          );
+          logEvent('email_generating', `📝 Generazione candidatura personalizzata per ${nextItem.company_name}...`);
 
           const candidateName = cvData?.nome
             ? `${cvData.nome} ${cvData?.cognome || ''}`.trim()
             : profile?.full_name || '';
 
-          // Try AI generation
           let subject = '';
           let bodyText = '';
 
@@ -765,7 +1510,7 @@ export function useAutoCampaign() {
               name: nextItem.company_name,
               email: nextItem.company_email,
               city: nextItem.company_city || campaign.search_location || 'Ticino',
-              sector: nextItem.company_sector || 'Produzione / Settore Tecnico',
+              sector: nextItem.company_sector || 'Produzione industriale',
               website: nextItem.company_website || undefined,
             };
 
@@ -773,23 +1518,16 @@ export function useAutoCampaign() {
               ? campaign.email_style
               : 'standard') as 'breve' | 'standard' | 'formale';
 
-            const emailRes = await aiAgent.generateEmail(
-              targetCompany,
-              cvData || {},
-              styleVariant,
-              undefined,
-              ''
-            );
-
+            const emailRes = await aiAgent.generateEmail(targetCompany, cvData || {}, styleVariant, '', '');
             if (emailRes.success && emailRes.data) {
               subject = emailRes.data.oggetto || '';
-              bodyText = emailRes.data.corpo || '';
+              const firmaText = emailRes.data.firma || formatCandidateSignature(cvData, 'text');
+              bodyText = `${emailRes.data.corpo}\n\n${firmaText}`;
             }
           } catch (genErr) {
             console.warn('[AutoCampaign] Generazione AI fallback a template variato:', genErr);
           }
 
-          // Guarantee non-identical subject and body variations for anti-spam safety
           const seedIndex = campaign.total_sent + Math.floor(Math.random() * 10);
           const varied = generateVariedEmail({
             candidateName,
@@ -797,27 +1535,55 @@ export function useAutoCampaign() {
             companyCity: nextItem.company_city,
             companySector: nextItem.company_sector,
             skills: cvData?.competenze,
+            experiences: cvData?.esperienze,
+            cvData,
             style: campaign.email_style,
             seedIndex,
           });
 
-          subject = subject || varied.subject;
-          bodyText = bodyText || varied.bodyText;
+          subject = (subject || varied.subject).trim();
+          bodyText = enforceEmailBodyRules((bodyText || varied.bodyText).trim(), cvData);
+
+          // Audit pre-send
+          const audit = auditEmailPreSend({
+            to: nextItem.company_email,
+            subject,
+            corpo: bodyText,
+            firma: formatCandidateSignature(cvData, 'text'),
+            cvData,
+            hasAttachment: true,
+            isBlacklisted: false,
+          });
+
+          if (!audit.isValid) {
+            const reasons = audit.errors.join('; ');
+            const errMsg = `Invio bloccato per mancata conformità regole email: ${reasons}`;
+            logEvent('error', `❌ ${errMsg}`);
+            updateQueueItem(nextItem.id, { status: 'failed', error_message: errMsg });
+            return;
+          }
 
           updateQueueItem(nextItem.id, { status: 'email_generated' });
-          logEvent('email_ready', `✉️ Email personalizzata pronta con allegato ${attachment.filename}. Invio a ${nextItem.company_email}...`);
+
+          const sanitizedHtml = bodyText
+            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+            .replace(/\*/g, '')
+            .replace(/\n\n/g, '<br><br>')
+            .replace(/\n/g, '<br>');
 
           // Attempt send
           let sendSuccess = false;
           let sendError: string | null = null;
+          let needsAuth = false;
+          let sentMessageId: string | undefined = undefined;
+          let sentThreadId: string | undefined = undefined;
 
           try {
-            // 1. Try Gmail API directly (non-interactive in automode)
             const gmailRes = await sendViaGmailApi(
               {
                 to: nextItem.company_email,
                 subject,
-                bodyHtml: bodyText.replace(/\n/g, '<br/>'),
+                bodyHtml: sanitizedHtml,
                 attachment,
               },
               { interactive: false }
@@ -825,25 +1591,27 @@ export function useAutoCampaign() {
 
             if (gmailRes.success) {
               sendSuccess = true;
-              logEvent('gmail_api', `✅ Candidatura inviata via Gmail API con allegato CV PDF (${attachment.filename}) a ${nextItem.company_name}`);
+              sentMessageId = gmailRes.messageId;
+              sentThreadId = gmailRes.threadId;
+              logEvent('gmail_api', `✅ Candidatura inviata via Gmail API (${attachment.filename}) a ${nextItem.company_name}`);
             } else {
               sendError = gmailRes.error || 'Invio Gmail non riuscito';
+              needsAuth = !!gmailRes.needsInteractiveAuth;
             }
           } catch (e: any) {
-            sendError = e.message || 'Errore di connessione durante l\'invio';
+            sendError = e.message || "Errore di connessione durante l'invio";
           }
 
           if (sendSuccess) {
-            const now = Date.now();
-            const { updatedState, nextIntervalMs, isBlockPause, isDailyLimitReached } = recordSendSuccess(pacingState, now);
+            const sendNow = Date.now();
+            const { updatedState, nextIntervalMs, isBlockPause, isDailyLimitReached } = recordSendSuccess(pacingState, sendNow);
             setPacingState(updatedState);
             savePacingState(updatedState, userId);
 
-            const nextSendIso = new Date(now + nextIntervalMs).toISOString();
+            const nextSendIso = new Date(sendNow + nextIntervalMs).toISOString();
+            updateQueueItem(nextItem.id, { status: 'sent', sent_at: new Date(sendNow).toISOString() });
 
-            updateQueueItem(nextItem.id, { status: 'sent', sent_at: new Date(now).toISOString() });
-
-            const newTotalSent = campaign.total_sent + 1;
+            const newTotalSent = (campaign.total_sent || 0) + 1;
             const newTotalGen = (campaign.total_generated || 0) + 1;
 
             updateCampaignState({
@@ -859,41 +1627,31 @@ export function useAutoCampaign() {
             });
 
             if (isDailyLimitReached) {
-              logEvent(
-                'daily_limit',
-                `🛑 Limite massimo di 50 invii raggiunto per oggi (50/50). Auto Mode interrotto fino a domani per proteggere l'account Gmail.`
-              );
+              logEvent('daily_limit', `🛑 Limite massimo di 50 invii raggiunto per oggi (50/50). Auto Mode sospeso fino a domani.`);
               toast({
                 title: '🛑 Limite Giornaliero Raggiunto (50/50)',
-                description: 'Candidature completate per oggi. L\'invio riprenderà automaticamente domani.',
+                description: "Candidature completate per oggi. L'invio riprenderà automaticamente domani.",
               });
             } else if (isBlockPause) {
               const pauseMin = Math.round(nextIntervalMs / 60000);
-              logEvent(
-                'block_pause',
-                `⏸️ Pausa di sicurezza: inviato blocco di ${pacingState.currentBlockTarget} candidature. Pausa programmata di ${pauseMin} minuti per evitare filtri antispam.`
-              );
+              logEvent('block_pause', `⏸️ Pausa di sicurezza: blocco di candidature completato. Pausa di ${pauseMin} minuti antispam.`);
             } else {
               const nextMin = (nextIntervalMs / 60000).toFixed(1);
-              logEvent(
-                'email_sent',
-                `✉️ Inviata a ${nextItem.company_name}. Intervallo naturale casuale: prossimo invio tra ~${nextMin} min.`
-              );
+              logEvent('email_sent', `✉️ Inviata a ${nextItem.company_name}. Prossimo invio programmato tra ~${nextMin} min.`);
             }
 
-            const recorded = await aiAgent.recordSentEmail(
+            // Record to Firestore sent emails collection (Source of Truth)
+            await aiAgent.recordSentEmail(
               nextItem.id,
               nextItem.company_name,
               nextItem.company_email,
               subject,
               bodyText,
               attachment.filename,
-              userId
+              userId,
+              sentMessageId,
+              sentThreadId
             );
-            if (!recorded.success) {
-              updateCampaignState({ status: 'paused', pause_reason: 'Email inviata, ma storico non salvato in Firestore. Verifica prima di riprendere.' });
-              logEvent('error', recorded.error || 'Errore salvataggio storico');
-            }
 
             if (addLogInvio) {
               addLogInvio({
@@ -919,63 +1677,63 @@ export function useAutoCampaign() {
               });
             }
           } else {
-            // Handle send error with anti-spam pacing rules
-            const now = Date.now();
-            const { updatedState, isFatalGmail, waitMs, reason } = recordSendError(pacingState, sendError || 'Errore fornitore email', now);
-            setPacingState(updatedState);
-            savePacingState(updatedState, userId);
-
-            updateQueueItem(nextItem.id, {
-              status: 'failed',
-              error_message: sendError,
-            });
-
-            updateCampaignState({
-              total_failed: (campaign.total_failed || 0) + 1,
-              pause_reason: reason,
-              resume_at: waitMs > 0 ? new Date(now + waitMs).toISOString() : null,
-              status: isFatalGmail ? 'paused' : 'running',
-              gmail_error: isFatalGmail ? (sendError || 'Errore Gmail') : null,
-              active_pause_type: updatedState.pauseType,
-            });
-
-            if (isFatalGmail) {
-              logEvent(
-                'rate_limit',
-                `🚨 ERRORE GMAIL CRITICO: ${sendError}. Auto Mode interrotto immediatamente per salvaguardare l'account.`
-              );
+            if (needsAuth) {
+              updateQueueItem(nextItem.id, { status: 'pending' });
+              updateCampaignState({
+                status: 'paused',
+                pause_reason: sendError || 'Autorizzazione Gmail assente o scaduta.',
+                gmail_error: sendError || 'Autorizzazione Gmail assente o scaduta.',
+              });
+              logEvent('error', `🛑 Auto Mode in pausa: ${sendError || 'Autorizzazione Gmail necessaria'}.`);
               toast({
-                title: '🚨 Errore Gmail Rilevato',
-                description: `Auto Mode arrestato: ${sendError}. Riconnetti l'account.`,
+                title: 'Autorizzazione Gmail Richiesta',
+                description: 'Auto Mode è in pausa. Riconnetti Gmail per riprendere gli invii.',
                 variant: 'destructive',
               });
             } else {
-              logEvent(
-                'email_failed',
-                `⚠️ Invio a ${nextItem.company_name} non riuscito: ${sendError}. Nessun retry massivo: attesa precauzionale di 30 minuti.`
-              );
+              const sendNow = Date.now();
+              const { updatedState, isFatalGmail, waitMs, reason } = recordSendError(pacingState, sendError || 'Errore fornitore email', sendNow);
+              setPacingState(updatedState);
+              savePacingState(updatedState, userId);
+
+              updateQueueItem(nextItem.id, {
+                status: 'failed',
+                error_message: sendError,
+              });
+
+              updateCampaignState({
+                total_failed: (campaign.total_failed || 0) + 1,
+                pause_reason: reason,
+                resume_at: waitMs > 0 ? new Date(sendNow + waitMs).toISOString() : null,
+                status: isFatalGmail ? 'paused' : 'running',
+                gmail_error: isFatalGmail ? (sendError || 'Errore Gmail') : null,
+                active_pause_type: updatedState.pauseType,
+              });
+
+              if (isFatalGmail) {
+                logEvent('rate_limit', `🚨 ERRORE GMAIL CRITICO: ${sendError}. Auto Mode arrestato.`);
+                toast({
+                  title: '🚨 Errore Gmail Rilevato',
+                  description: `Auto Mode arrestato: ${sendError}.`,
+                  variant: 'destructive',
+                });
+              } else {
+                logEvent('email_failed', `⚠️ Invio a ${nextItem.company_name} non riuscito: ${sendError}.`);
+              }
             }
           }
-        } else if (campaign.total_sent >= campaign.target_total) {
-          updateCampaignState({
-            status: 'completed',
-            completed_at: new Date().toISOString(),
-          });
-          logEvent('target_completed', `🎯 Obiettivo completato: ${campaign.total_sent} candidature.`);
         }
       } catch (err: any) {
-        console.error('[AutoCampaign] Engine error:', err);
+        console.error('[AutoCampaign] Engine loop error:', err);
       } finally {
         isRunningStepRef.current = false;
       }
     };
 
-    // Polite polling interval to inspect nextScheduledSendAt and execute when allowed
     const timer = setInterval(() => {
       executeCycle();
-    }, 4000);
+    }, RUNNER_HEARTBEAT_INTERVAL_MS);
 
-    // Also run immediately on trigger or mount
     executeCycle();
 
     return () => {
@@ -992,6 +1750,8 @@ export function useAutoCampaign() {
     campaign?.search_radius,
     campaign?.search_keywords,
     campaign?.email_style,
+    campaign?.runner_lock?.tab_id,
+    campaign?.runner_lock?.heartbeat_at,
     queueItems.length,
     processorTriggerRef.current,
     pacingState,
@@ -999,6 +1759,8 @@ export function useAutoCampaign() {
     sintesiBreve,
     profile,
     userId,
+    tabId,
+    isLeader,
     logEvent,
     updateCampaignState,
     updateQueueItem,
@@ -1011,6 +1773,8 @@ export function useAutoCampaign() {
     events,
     queueItems,
     isLoading,
+    isLeader,
+    tabId,
     pacingState,
     clearGmailError,
     startCampaign,

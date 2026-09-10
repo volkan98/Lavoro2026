@@ -1,4 +1,4 @@
-import { apiFetch } from '@/lib/api/client';
+import { apiFetch, safeJsonResponse } from '@/lib/api/client';
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -30,13 +30,13 @@ export default function OAuthCallback() {
       }
 
       try {
-        const response = await apiFetch('/api/oauth/callback', {
+        const response = await apiFetch('/api/oauth/exchange', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ code, provider: state }),
         });
 
-        const data = await response.json();
+        const data = await safeJsonResponse(response);
         if (data.success) {
           setStatus('success');
           setMessage('Account Gmail collegato con successo!');

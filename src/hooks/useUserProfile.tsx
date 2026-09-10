@@ -3,7 +3,7 @@ import { useAuth } from './useAuth';
 import type { CVData } from '@/types/cv';
 import { normalizeCvData, hasCvData, getEmptyCvData } from '@/lib/cvNormalizer';
 import { persistCvFile, loadCvBinary, CvBinary } from '@/lib/cvStorage';
-import { readCvSnapshot, writeCvSnapshot, UserDocument, profileFromCv } from '@/lib/cvRepository';
+import { readCvSnapshot, writeCvSnapshot, UserDocument, profileFromCv, cachedDocument } from '@/lib/cvRepository';
 import { requireUid } from '@/lib/api/client';
 
 export type UserProfile = ReturnType<typeof profileFromCv>;
@@ -38,7 +38,6 @@ function useProfileState() {
       setDocument(result.document);
       if (!dirty.current) updateCvData(result.document.cvParsedData || getEmptyCvData());
       setBinary(result.binary); setSource(result.source);
-      if (result.source === 'cache') setSyncError('Firestore non raggiungibile: visualizzo l’ultima copia locale.');
       return result.document.profile as UserProfile || null;
     } catch (error: any) {
       if (request === revision.current) setSyncError(error.message || 'Sincronizzazione non riuscita');

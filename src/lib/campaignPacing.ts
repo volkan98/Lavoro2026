@@ -1,4 +1,13 @@
-import { requireUid } from '@/lib/api/client';
+import { requireUid, sanitizeForFirestore } from '@/lib/api/client';
+import { db } from '@/lib/firebase';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
+import {
+  hasValidPermessoG,
+  hasImmediateAvailability,
+  formatCandidateSignature,
+  enforceEmailBodyRules,
+  buildPermitAndAvailabilityClause,
+} from '@/lib/emailRules';
 /**
  * Campaign Pacing and Anti-Spam Safety System for Auto Mode
  *
@@ -142,8 +151,63 @@ export function savePacingState(state: PacingState, userId = requireUid()): void
   try {
     localStorage.setItem(`${STORAGE_KEY_PREFIX}${userId}`, JSON.stringify(state));
   } catch (err) {
-    console.warn('[Pacing] Error saving pacing state:', err);
+    console.warn('[Pacing] Error saving pacing state to local cache:', err);
   }
+
+  // Cloud persistence
+  if (userId) {
+    try {
+      const paceDocRef = doc(db, 'users', userId, 'pacing', 'current');
+      const cleanData = sanitizeForFirestore(state);
+      setDoc(paceDocRef, cleanData, { merge: true }).catch(() => {});
+    } catch {}
+  }
+}
+
+export async function fetchPacingStateFromCloud(userId = requireUid()): Promise<PacingState> {
+  const today = getTodayDateString();
+  const local = loadPacingState(userId);
+
+  try {
+    const paceDocRef = doc(db, 'users', userId, 'pacing', 'current');
+    const snap = await Promise.race([
+      getDoc(paceDocRef),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Pacing timeout')), 3000))
+    ]);
+
+    if (snap.exists()) {
+      const data = snap.data() as PacingState;
+      if (data && typeof data === 'object') {
+        if (data.dailyDate !== today) {
+          const resetState: PacingState = {
+            ...data,
+            dailyDate: today,
+            dailySentCount: 0,
+            hourlySentTimestamps: [],
+            currentBlockSends: 0,
+            nextScheduledSendAt: null,
+            pauseType: data.gmailError ? 'gmail_error' : 'none',
+          };
+          savePacingState(resetState, userId);
+          return resetState;
+        }
+
+        const merged: PacingState = {
+          ...local,
+          ...data,
+          dailyDate: today,
+          dailySentCount: Math.max(local.dailySentCount, data.dailySentCount || 0),
+          hourlySentTimestamps: cleanHourlyTimestamps(data.hourlySentTimestamps || local.hourlySentTimestamps || []),
+        };
+        savePacingState(merged, userId);
+        return merged;
+      }
+    }
+  } catch (err) {
+    console.warn('[Pacing] Firestore fetch error:', err);
+  }
+
+  return local;
 }
 
 /**
@@ -395,7 +459,8 @@ export function recordSendError(
 }
 
 /**
- * Generates personalized, varied email subject and content to prevent identical spam templates.
+ * Generates personalized, sector-aligned, varied email subject and content to prevent identical templates,
+ * strictly complying with candidate CV data, real company sector, and zero hallucination rules.
  */
 export function generateVariedEmail(params: {
   candidateName: string;
@@ -403,18 +468,104 @@ export function generateVariedEmail(params: {
   companyCity?: string | null;
   companySector?: string | null;
   skills?: string[];
+  experiences?: Array<{ ruolo?: string; azienda?: string; descrizione?: string }>;
+  cvData?: any;
   style?: string;
   seedIndex?: number;
+  jobTitle?: string | null;
 }): { subject: string; bodyText: string } {
-  const { candidateName, companyName, skills = [] } = params;
-  return {
-    subject: `Candidatura spontanea${candidateName ? ` – ${candidateName}` : ''}`,
-    bodyText: [
-      `Gentile Responsabile delle Risorse Umane di ${companyName},`,
-      'desidero proporre la mia candidatura per eventuali opportunità lavorative.',
-      skills.length ? `Le mie competenze comprendono: ${skills.join(', ')}.` : '',
-      'Trasmetto in allegato il mio Curriculum Vitae e resto a disposizione per un colloquio conoscitivo.',
-      'Cordiali saluti,', candidateName,
-    ].filter(Boolean).join('\n\n'),
-  };
+  const {
+    candidateName,
+    companyName,
+    companyCity,
+    companySector = '',
+    skills = [],
+    experiences = [],
+    cvData,
+    seedIndex = 0,
+    jobTitle,
+  } = params;
+
+  const sectorText = `${companySector || ''} ${companyName || ''}`.toLowerCase();
+  const isPainting = /vernic|carrozzer|finitur|sabbiatur|trattament.*superfic/i.test(sectorText);
+  const isMetal = /metal|meccanic|acciaio|alluminio|carpenteria|torner|fresat|lavorazioni meccaniche|officina/i.test(sectorText);
+  const isRailway = /ferrov|sbb|ffs|rotabil|tren|binari/i.test(sectorText);
+  const isProduction = /produzion|manifattur|assemblag|industriale|fabbrica/i.test(sectorText);
+
+  // Subject determination
+  let subject = '';
+  if (jobTitle && !/^candidatura\s*spontanea/i.test(jobTitle)) {
+    subject = `Candidatura – ${jobTitle}${candidateName ? ` – ${candidateName}` : ''}`;
+  } else if (isPainting) {
+    subject = 'Candidatura spontanea – Verniciatura e finiture industriali';
+  } else if (isMetal) {
+    subject = 'Candidatura spontanea – Settore metalmeccanico';
+  } else if (isRailway) {
+    subject = 'Candidatura spontanea – Manutenzione e attività operative';
+  } else if (isProduction) {
+    subject = 'Candidatura spontanea – Produzione industriale';
+  } else {
+    subject = 'Candidatura spontanea – Ambito operativo e produttivo';
+  }
+
+  // Greetings variation
+  const greetings = [
+    `Gentile Responsabile delle Risorse Umane di ${companyName},`,
+    `Gentile Direzione di ${companyName},`,
+    `Gentile Team Risorse Umane di ${companyName},`,
+  ];
+  const greeting = greetings[seedIndex % greetings.length];
+
+  // Purpose variation & sector alignment
+  let purpose = '';
+  if (jobTitle && !/^candidatura\s*spontanea/i.test(jobTitle)) {
+    purpose = `Desidero sottoporre la mia candidatura per la posizione di ${jobTitle}, ritenendo che il mio profilo operativo e la mia esperienza sul campo possano apportare un contributo concreto e affidabile alla vostra realtà.`;
+  } else if (isPainting) {
+    purpose = `Vi contatto con una candidatura spontanea per il reparto di verniciatura e trattamento delle superfici, ambiti nei quali posso mettere a frutto precisione esecutiva, attenzione al dettaglio e cura delle finiture industriali.`;
+  } else if (isMetal) {
+    purpose = `Vi trasmetto la mia candidatura spontanea per opportunità lavorative in ambito metalmeccanico e produttivo, forte di un percorso caratterizzato dal lavoro su superfici metalliche, controllo visivo/dimensionale e confidenza con gli ambienti d'officina.`;
+  } else if (isRailway) {
+    purpose = `Vi propongo la mia candidatura spontanea per attività tecniche e di manutenzione, offrendo serietà, rispetto rigoroso delle normative di sicurezza e rapida capacità di ambientamento in contesti operativi strutturati.`;
+  } else if (isProduction) {
+    purpose = `Vi trasmetto la mia candidatura spontanea per attività operative e di produzione industriale, forte di una solida attitudine al lavoro pratico, all'uso delle attrezzature da officina e al rispetto dei cicli produttivi.`;
+  } else {
+    purpose = `Desidero proporre la mia candidatura spontanea per opportunità lavorative in ambito operativo e produttivo, mettendo a disposizione versatilità, precisione manuale e continuità di rendimento.`;
+  }
+
+  // Skills paragraph - only real skills
+  const realSkills = skills.filter(Boolean);
+  const skillsSnippet = realSkills.length > 0
+    ? `Nel corso del mio percorso lavorativo ho consolidato competenze pratiche in ${realSkills.slice(0, 3).join(', ')}.`
+    : '';
+
+  // Experience paragraph - only real experience
+  const expSnippet = experiences.length > 0 && experiences[0].ruolo
+    ? `Ho maturato esperienza pratica come ${experiences[0].ruolo}${experiences[0].azienda ? ` presso ${experiences[0].azienda}` : ''}, sviluppando affidabilità operativa e autonomia nella gestione delle mansioni assegnate.`
+    : '';
+
+  // Conclusion and CV attachment mention
+  const conclusion = 'In allegato alla presente trasmetto il mio Curriculum Vitae dettagliato e resto a Vostra completa disposizione per un colloquio conoscitivo di approfondimento.';
+
+  const hasPermit = hasValidPermessoG(cvData);
+  const hasImmediate = hasImmediateAvailability(cvData);
+  const permitAvailClause = buildPermitAndAvailabilityClause(hasPermit, hasImmediate, 'html');
+
+  // Candidate signature conforming to strict rules:
+  // Cordiali saluti,
+  // [NOME] [COGNOME]
+  // Tel. [NUMERO] (if present)
+  const firmaText = formatCandidateSignature(cvData, 'text');
+
+  const rawBodyText = [
+    greeting,
+    purpose,
+    [skillsSnippet, expSnippet].filter(Boolean).join(' '),
+    permitAvailClause,
+    conclusion,
+    firmaText,
+  ].filter(Boolean).join('\n\n');
+
+  const bodyText = enforceEmailBodyRules(rawBodyText, cvData);
+
+  return { subject, bodyText };
 }

@@ -9,6 +9,7 @@ import { AccountDetailsModal } from '@/components/auth/AccountDetailsModal';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { LogOut, Sparkles, User, ShieldBan, CheckCircle2 } from 'lucide-react';
+import { BUILD_VERSION } from '@/lib/version';
 
 interface AppLayoutProps {
   children: ReactNode;
@@ -109,10 +110,13 @@ export function AppLayout({ children }: AppLayoutProps) {
 
       {/* Footer */}
       <footer className="bg-card border-t border-border py-3 sm:py-4">
-        <div className="container mx-auto px-4 text-center">
-          <p className="text-xs sm:text-sm text-muted-foreground">
+        <div className="container mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2 text-center sm:text-left">
+          <p className="text-xs text-muted-foreground">
             © 2024 AI Job Agent • Supporto Permesso G Svizzera & Frontalieri • Powered by Google Gemini
           </p>
+          <span className="text-[11px] font-mono text-muted-foreground/70 bg-muted/50 px-2 py-0.5 rounded border border-border/40">
+            Build: {BUILD_VERSION}
+          </span>
         </div>
       </footer>
     </div>

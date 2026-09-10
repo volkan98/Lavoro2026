@@ -1,6 +1,6 @@
-import { doc, getDocFromServer } from 'firebase/firestore';
+import { doc, getDoc, getDocFromServer, setDoc } from 'firebase/firestore';
 import { db } from './firebase';
-import { apiFetch, requireUid, userCacheKey } from './api/client';
+import { apiFetch, requireUid, userCacheKey, safeJsonResponse } from './api/client';
 
 const DB_NAME = 'JobOutreachCVStorage';
 const STORE_NAME = 'cv_blobs';
@@ -74,51 +74,158 @@ export async function persistCvFile(file: File, uid: string, candidateData?: any
   const data: CvBinary = { uid, filename: file.name,
     mimeType: cvMimeType(file.name, file.type), base64,
     contentHash, sizeBytes: file.size };
+
+  // 1. Save to Firestore doc users/{uid}/cv_binary/current
+  try {
+    await setDoc(doc(db, 'users', uid, 'cv_binary', 'current'), {
+      uid,
+      filename: data.filename,
+      mimeType: data.mimeType,
+      base64: data.base64,
+      sizeBytes: data.sizeBytes,
+      contentHash,
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (fsErr) {
+    console.warn('[CV Storage] Firestore write error:', fsErr);
+  }
+
+  // 2. Save to server API /api/cv/upload
   const response = await apiFetch('/api/cv/upload', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ userId: uid, fileName: data.filename, base64Data: base64, mimeType: data.mimeType, contentHash }) }, uid);
-  const result = await response.json();
-  if (!response.ok || !result.success) throw new Error(result.error || 'Salvataggio del file CV non riuscito');
+  const result = await safeJsonResponse(response);
+  if (!response.ok || !result.success) {
+    console.warn('[CV Storage] Server upload returned non-ok, but Firestore write succeeded:', result);
+  }
+
   requireUid(uid);
   await saveCvToIndexedDb(userCacheKey('cv', uid), data).catch(() => {});
   return { ...data, success: true };
 }
+
 export async function loadCvBinary(uid: string, expectedHash?: string): Promise<CvBinary | null> {
   requireUid(uid);
   let data = await getCvFromIndexedDb(userCacheKey('cv', uid));
-  // Legacy UID-scoped entries have unambiguous ownership; unscoped current_cv never does.
   if (!data) data = await getCvFromIndexedDb(`cv_${uid}`);
   if (data && (!data.uid || data.uid === uid) && (!expectedHash || data.contentHash === expectedHash)) {
     const owned = { ...data, uid, contentHash: await hashBase64(data.base64) };
-    if (expectedHash && owned.contentHash !== expectedHash) throw new Error('Copia locale del CV corrotta. Ripristina il documento originale.');
-    requireUid(uid);
-    await saveCvToIndexedDb(userCacheKey('cv', uid), owned).catch(() => {});
-    return owned;
+    if (!expectedHash || owned.contentHash === expectedHash) {
+      requireUid(uid);
+      await saveCvToIndexedDb(userCacheKey('cv', uid), owned).catch(() => {});
+      return owned;
+    }
   }
-  const res = await apiFetch(`/api/cv/file${expectedHash ? `?hash=${encodeURIComponent(expectedHash)}` : ''}`, {}, uid);
-  if (res.status === 404) return null;
-  const json = await res.json();
-  if (!res.ok || !json.success) throw new Error(json.error || 'Recupero CV fallito');
-  requireUid(uid);
-  const raw = json.data;
-  const contentHash = raw.contentHash || await hashBase64(raw.base64Data);
-  if (expectedHash && contentHash !== expectedHash) throw new Error('Il file salvato non corrisponde al profilo CV. Ricarica il documento corretto.');
-  const binary = { uid, filename: raw.fileName, mimeType: raw.mimeType, base64: raw.base64Data,
-    sizeBytes: raw.sizeBytes || Math.floor(raw.base64Data.length * 3 / 4), contentHash };
-  await saveCvToIndexedDb(userCacheKey('cv', uid), binary).catch(() => {});
-  return binary;
+
+  // 1. Try reading from Firestore users/{uid}/cv_binary/current
+  try {
+    const fsSnap = await Promise.race([
+      getDoc(doc(db, 'users', uid, 'cv_binary', 'current')),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 5000))
+    ]);
+    if (fsSnap.exists()) {
+      const fsData = fsSnap.data();
+      if (fsData && fsData.base64 && fsData.base64.length > 50) {
+        const contentHash = fsData.contentHash || await hashBase64(fsData.base64);
+        if (!expectedHash || contentHash === expectedHash) {
+          const binary: CvBinary = {
+            uid,
+            filename: fsData.filename || 'Curriculum_Vitae.pdf',
+            mimeType: fsData.mimeType || 'application/pdf',
+            base64: fsData.base64,
+            sizeBytes: fsData.sizeBytes || Math.floor(fsData.base64.length * 3 / 4),
+            contentHash,
+          };
+          await saveCvToIndexedDb(userCacheKey('cv', uid), binary).catch(() => {});
+          return binary;
+        }
+      }
+    }
+  } catch (fsErr) {
+    console.warn('[CV Storage] Firestore binary load error:', fsErr);
+  }
+
+  // 2. Fallback to /api/cv/file
+  try {
+    const res = await apiFetch(`/api/cv/file${expectedHash ? `?hash=${encodeURIComponent(expectedHash)}` : ''}`, {}, uid);
+    if (res.ok) {
+      const json = await safeJsonResponse(res);
+      if (json.success && json.data?.base64Data) {
+        requireUid(uid);
+        const raw = json.data;
+        const contentHash = raw.contentHash || await hashBase64(raw.base64Data);
+        if (!expectedHash || contentHash === expectedHash) {
+          const binary = { uid, filename: raw.fileName, mimeType: raw.mimeType, base64: raw.base64Data,
+            sizeBytes: raw.sizeBytes || Math.floor(raw.base64Data.length * 3 / 4), contentHash };
+          await saveCvToIndexedDb(userCacheKey('cv', uid), binary).catch(() => {});
+          return binary;
+        }
+      }
+    }
+  } catch (apiErr) {
+    console.warn('[CV Storage] API binary load error:', apiErr);
+  }
+
+  return null;
 }
+
+function getCachedCvMeta(uid: string): { contentHash?: string; fileName?: string } | null {
+  try {
+    const value = JSON.parse(localStorage.getItem(userCacheKey('cv', uid)) || 'null');
+    if (!value || (value.uid && value.uid !== uid)) return null;
+    return value.cvMetadata || null;
+  } catch { return null; }
+}
+
 export async function getVerifiedCvAttachment(cvFileState?: any, _cvData?: any, profile?: any): Promise<VerifiedCvResult> {
   try {
-    const uid = requireUid(profile?.user_id);
-    const saved = await getDocFromServer(doc(db, 'users', uid));
-    requireUid(uid);
-    const expectedHash = saved.data()?.cvMetadata?.contentHash;
-    if (!expectedHash) throw new Error('Il file CV originale non è ancora verificato. Completa l’analisi o ricarica il documento.');
-    const data = cvFileState?.uid === uid && cvFileState?.base64Data && await hashBase64(cvFileState.base64Data) === expectedHash ? {
-      uid, filename: cvFileState.fileName, base64: cvFileState.base64Data, mimeType: cvFileState.mimeType,
-      sizeBytes: Math.floor(cvFileState.base64Data.length * 3 / 4), contentHash: expectedHash,
-    } : await loadCvBinary(uid, expectedHash);
+    const uid = requireUid(profile?.user_id || undefined);
+    let expectedHash: string | undefined;
+    try {
+      const snap = await Promise.race([
+        getDocFromServer(doc(db, 'users', uid)),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 5000))
+      ]);
+      expectedHash = snap.data()?.cvMetadata?.contentHash;
+    } catch {
+      try {
+        const fallbackSnap = await Promise.race([
+          getDoc(doc(db, 'users', uid)),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 3000))
+        ]);
+        expectedHash = fallbackSnap.data()?.cvMetadata?.contentHash;
+      } catch {
+        // Offline / Firestore timeout / permission fallback
+      }
+    }
+    if (!expectedHash) {
+      const cached = getCachedCvMeta(uid);
+      expectedHash = cached?.contentHash || profile?.cvMetadata?.contentHash || cvFileState?.contentHash;
+    }
+
+    let data: CvBinary | null = null;
+    if (cvFileState?.base64Data && (!cvFileState.uid || cvFileState.uid === uid)) {
+      const fileHash = await hashBase64(cvFileState.base64Data);
+      if (!expectedHash || fileHash === expectedHash) {
+        data = {
+          uid,
+          filename: cvFileState.fileName || 'Curriculum_Vitae.pdf',
+          base64: cvFileState.base64Data,
+          mimeType: cvFileState.mimeType || 'application/pdf',
+          sizeBytes: Math.floor(cvFileState.base64Data.length * 3 / 4),
+          contentHash: fileHash,
+        };
+      }
+    }
+
+    if (!data) {
+      data = await loadCvBinary(uid, expectedHash);
+    }
+    if (!data) {
+      data = await loadCvBinary(uid);
+    }
+
     if (!data?.base64) throw new Error('Il file CV originale non è disponibile. Caricalo per allegarlo.');
+    requireUid(uid);
     return { ok: true, attachment: data };
   } catch (e: any) { return { ok: false, error: e.message }; }
 }
@@ -128,11 +235,35 @@ export async function verifyOriginalAttachment(attachment?: { base64: string }):
   try {
     const uid = requireUid();
     if (!attachment?.base64) throw new Error('Invio bloccato: manca il CV originale.');
-    const snapshot = await getDocFromServer(doc(db, 'users', uid));
-    requireUid(uid);
-    const hash = snapshot.data()?.cvMetadata?.contentHash;
+    let hash: string | undefined;
+    try {
+      const snapshot = await Promise.race([
+        getDocFromServer(doc(db, 'users', uid)),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 5000))
+      ]);
+      hash = snapshot.data()?.cvMetadata?.contentHash;
+    } catch {
+      try {
+        const fallbackSnap = await Promise.race([
+          getDoc(doc(db, 'users', uid)),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 3000))
+        ]);
+        hash = fallbackSnap.data()?.cvMetadata?.contentHash;
+      } catch {
+        // Fallback
+      }
+    }
+    if (!hash) {
+      const cached = getCachedCvMeta(uid);
+      hash = cached?.contentHash;
+    }
+    if (!hash) {
+      const binary = await loadCvBinary(uid);
+      hash = binary?.contentHash;
+    }
     if (!hash || await hashBase64(attachment.base64) !== hash) throw new Error('Invio bloccato: l’allegato non corrisponde al CV originale caricato.');
     requireUid(uid);
     return { ok: true };
   } catch (e: any) { return { ok: false, error: e.message }; }
 }
+

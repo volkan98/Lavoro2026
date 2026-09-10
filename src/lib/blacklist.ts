@@ -1,6 +1,9 @@
 import { scopedStorageKey } from '@/lib/api/client';
-import { apiFetch } from '@/lib/api/client';
+import { apiFetch, safeJsonResponse } from '@/lib/api/client';
 import { useState, useEffect, useCallback, useMemo } from 'react';
+import { db } from '@/lib/firebase';
+import { collection, doc, getDocs, setDoc, deleteDoc, onSnapshot } from 'firebase/firestore';
+import { useAuth } from '@/hooks/useAuth';
 
 export interface BlacklistEntry {
   id: string;
@@ -8,6 +11,7 @@ export interface BlacklistEntry {
   type: 'email' | 'domain';
   addedAt: string;
   notes?: string;
+  user_id?: string;
 }
 
 export const STORAGE_KEY_BLACKLIST = 'job_agent_blacklist';
@@ -85,67 +89,141 @@ export function saveLocalBlacklist(list: BlacklistEntry[]) {
   }
 }
 
+/**
+ * Fetch blacklist directly from Firestore for a user UID.
+ */
+export async function fetchFirestoreBlacklist(uid: string): Promise<BlacklistEntry[]> {
+  if (!uid) return [];
+  try {
+    const colRef = collection(db, 'users', uid, 'blacklist');
+    const snap = await getDocs(colRef);
+    const items: BlacklistEntry[] = [];
+    snap.forEach((d) => {
+      const data = d.data() as BlacklistEntry;
+      if (data && data.pattern) {
+        items.push({
+          id: d.id,
+          pattern: data.pattern,
+          type: data.type || 'email',
+          notes: data.notes,
+          addedAt: data.addedAt || new Date().toISOString(),
+          user_id: uid,
+        });
+      }
+    });
+    return items;
+  } catch (err) {
+    console.warn('[Blacklist] Firestore fetch error:', err);
+    return [];
+  }
+}
+
 export function useBlacklist() {
+  const { user } = useAuth();
+  const uid = user?.id;
+
   const [blacklist, setBlacklist] = useState<BlacklistEntry[]>(() => getLocalBlacklist());
   const [isLoading, setIsLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Sync from server and local storage
+  // Sync from Firestore (Primary source of truth) with auto-migration
+  useEffect(() => {
+    if (!uid) return;
+
+    setIsLoading(true);
+    const colRef = collection(db, 'users', uid, 'blacklist');
+
+    const unsubscribe = onSnapshot(
+      colRef,
+      async (snap) => {
+        const firestoreItems: BlacklistEntry[] = [];
+        snap.forEach((d) => {
+          const data = d.data() as BlacklistEntry;
+          if (data && data.pattern) {
+            firestoreItems.push({
+              id: d.id,
+              pattern: data.pattern,
+              type: data.type || 'email',
+              notes: data.notes,
+              addedAt: data.addedAt || new Date().toISOString(),
+              user_id: uid,
+            });
+          }
+        });
+
+        // Auto-migration: check if local storage has entries that are not in Firestore yet
+        const local = getLocalBlacklist();
+        const existingKeys = new Set(firestoreItems.map((i) => `${i.type}:${i.pattern.toLowerCase().trim()}`));
+        const missingFromFirestore: BlacklistEntry[] = [];
+
+        for (const locItem of local) {
+          if (!locItem || !locItem.pattern) continue;
+          const key = `${locItem.type || 'email'}:${locItem.pattern.toLowerCase().trim()}`;
+          if (!existingKeys.has(key)) {
+            missingFromFirestore.push(locItem);
+            existingKeys.add(key);
+          }
+        }
+
+        if (missingFromFirestore.length > 0) {
+          console.info(`[Blacklist] Migrazione di ${missingFromFirestore.length} regole locali su Firestore...`);
+          for (const item of missingFromFirestore) {
+      const ruleId = item.id || `bl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const entryDoc: Record<string, any> = {
+        id: ruleId,
+        pattern: item.pattern,
+        type: item.type || 'email',
+        notes: item.notes?.trim() || '',
+        addedAt: item.addedAt || new Date().toISOString(),
+        user_id: uid,
+      };
+      try {
+        await setDoc(doc(db, 'users', uid, 'blacklist', ruleId), entryDoc);
+        firestoreItems.unshift(entryDoc as BlacklistEntry);
+      } catch (err) {
+        console.warn('[Blacklist] Migration write error:', err);
+      }
+          }
+        }
+
+        setBlacklist(firestoreItems);
+        saveLocalBlacklist(firestoreItems);
+        setIsLoading(false);
+      },
+      (err) => {
+        console.warn('[Blacklist] Firestore snapshot error:', err);
+        setIsLoading(false);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [uid]);
+
   const fetchBlacklist = useCallback(async () => {
+    if (!uid) return;
+    setIsLoading(true);
     try {
-      setIsLoading(true);
-      const res = await apiFetch('/api/blacklist');
-      if (res.ok) {
-        const json = await res.json();
-        if (json.success && Array.isArray(json.data)) {
-          // Merge server list with local list
-          const local = getLocalBlacklist();
-          const combinedMap = new Map<string, BlacklistEntry>();
-          local.forEach((item) => {
-            if (item?.pattern) combinedMap.set(`${item.type || 'email'}:${item.pattern.toLowerCase().trim()}`, item);
-          });
-          json.data.forEach((item: BlacklistEntry) => {
-            if (item?.pattern) combinedMap.set(`${item.type || 'email'}:${item.pattern.toLowerCase().trim()}`, item);
-          });
-          const merged = Array.from(combinedMap.values());
-          setBlacklist(merged);
-          saveLocalBlacklist(merged);
-          return;
+      const items = await fetchFirestoreBlacklist(uid);
+      if (items.length > 0) {
+        setBlacklist(items);
+        saveLocalBlacklist(items);
+      } else {
+        // Try fallback to server
+        const res = await apiFetch('/api/blacklist');
+        if (res.ok) {
+          const json = await safeJsonResponse(res);
+          if (json.success && Array.isArray(json.data)) {
+            setBlacklist(json.data);
+            saveLocalBlacklist(json.data);
+          }
         }
       }
     } catch (err) {
-      console.warn('Server blacklist fetch error, using local:', err);
+      console.warn('Blacklist fetch error:', err);
     } finally {
       setIsLoading(false);
     }
-  }, []);
-
-  useEffect(() => {
-    fetchBlacklist();
-
-    const handleStorageChange = (e: StorageEvent) => {
-      if (e.key === STORAGE_KEY_BLACKLIST) {
-        setBlacklist(getLocalBlacklist());
-      }
-    };
-
-    const handleCustomChange = (e: Event) => {
-      const customEvent = e as CustomEvent<BlacklistEntry[]>;
-      if (customEvent.detail) {
-        setBlacklist(customEvent.detail);
-      } else {
-        setBlacklist(getLocalBlacklist());
-      }
-    };
-
-    window.addEventListener('storage', handleStorageChange);
-    window.addEventListener(BLACKLIST_CHANGE_EVENT, handleCustomChange);
-
-    return () => {
-      window.removeEventListener('storage', handleStorageChange);
-      window.removeEventListener(BLACKLIST_CHANGE_EVENT, handleCustomChange);
-    };
-  }, [fetchBlacklist]);
+  }, [uid]);
 
   const addToBlacklist = useCallback(
     async (rawInput: string, notes?: string): Promise<{ success: boolean; entry?: BlacklistEntry; alreadyExisted?: boolean }> => {
@@ -165,19 +243,39 @@ export function useBlacklist() {
         return { success: true, entry: existing, alreadyExisted: true };
       }
 
+      const ruleId = `bl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const cleanNotes = notes?.trim() || '';
       const newEntry: BlacklistEntry = {
-        id: `bl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        id: ruleId,
         pattern,
         type,
-        notes: notes?.trim() || undefined,
+        notes: cleanNotes,
         addedAt: new Date().toISOString(),
+        user_id: uid || '',
       };
 
       const updated = [newEntry, ...blacklist];
       setBlacklist(updated);
       saveLocalBlacklist(updated);
 
-      // Async sync to server
+      // Save directly to Firestore
+      if (uid) {
+        try {
+          const docData: Record<string, any> = {
+            id: ruleId,
+            pattern,
+            type,
+            notes: cleanNotes,
+            addedAt: newEntry.addedAt,
+            user_id: uid,
+          };
+          await setDoc(doc(db, 'users', uid, 'blacklist', ruleId), docData);
+        } catch (err) {
+          console.warn('Failed to save blacklist to Firestore:', err);
+        }
+      }
+
+      // Async sync to server API
       try {
         await apiFetch('/api/blacklist', {
           method: 'POST',
@@ -190,19 +288,33 @@ export function useBlacklist() {
 
       return { success: true, entry: newEntry };
     },
-    [blacklist]
+    [blacklist, uid]
   );
 
   const removeFromBlacklist = useCallback(
     async (idOrPattern: string): Promise<boolean> => {
       const target = idOrPattern.toLowerCase().trim();
+      const removedItems = blacklist.filter(
+        (b) => b.id === idOrPattern || b.pattern.toLowerCase() === target
+      );
       const updated = blacklist.filter(
         (b) => b.id !== idOrPattern && b.pattern.toLowerCase() !== target
       );
       setBlacklist(updated);
       saveLocalBlacklist(updated);
 
-      // Async sync to server
+      // Delete from Firestore
+      if (uid) {
+        for (const item of removedItems) {
+          try {
+            await deleteDoc(doc(db, 'users', uid, 'blacklist', item.id));
+          } catch (err) {
+            console.warn('Failed to delete blacklist from Firestore:', err);
+          }
+        }
+      }
+
+      // Async sync to server API
       try {
         await apiFetch(`/api/blacklist/${encodeURIComponent(idOrPattern)}`, {
           method: 'DELETE',
@@ -213,7 +325,7 @@ export function useBlacklist() {
 
       return true;
     },
-    [blacklist]
+    [blacklist, uid]
   );
 
   const check = useCallback(
@@ -246,3 +358,4 @@ export function useBlacklist() {
     refetch: fetchBlacklist,
   };
 }
+

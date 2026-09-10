@@ -1,10 +1,24 @@
 import type { RequestHandler } from 'express';
 import { getApps, initializeApp } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
+import { getFirestore } from 'firebase-admin/firestore';
 import config from '../firebase-applet-config.json';
 
+function getAdminApp() {
+  const existing = getApps();
+  if (existing.length > 0) return existing[0];
+  const projectId = config?.projectId || process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || 'gen-lang-client-0591706177';
+  return initializeApp(projectId ? { projectId } : undefined);
+}
+
+export function getAdminDb() {
+  const app = getAdminApp();
+  const databaseId = config?.firestoreDatabaseId || '(default)';
+  return getFirestore(app, databaseId);
+}
+
 export function firebaseAuthMiddleware(verify = (token: string) => {
-  const app = getApps()[0] || initializeApp({ projectId: config.projectId });
+  const app = getAdminApp();
   return getAuth(app).verifyIdToken(token);
 }): RequestHandler {
   return async (req, res, next) => {
